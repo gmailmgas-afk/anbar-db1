@@ -1,0 +1,69 @@
+[
+  {
+    "user_id": "USR-001",
+    "username": "amouei",
+    "password_salt": "e9b2a7f830419c8d12b0e45c7198a321",
+    "password_hash": "866ab120f94c788b13b98383b7cd799eb7d90abce6ccf84902672dd15fef10cc",
+    "is_password_changed": true,
+    "full_name": "آقای مهندس موسی عمویی",
+    "role": "ADMIN",
+    "role_title": "مدیریت ارشد",
+    "allowed_device_id": "SYS-AMOUEL-ADMIN-01",
+    "system_id": "SYS-AMOUEL-ADMIN-01",
+    "system_name": "سیستم اداری مدیر عامل (ویندوز 11)"
+  },
+  {
+    "user_id": "USR-002",
+    "username": "karami",
+    "password_salt": "d4c1b8a920538f7e21a0d34b8297b412",
+    "password_hash": "5d0e1bf5fcde3e15776e55dc299d0c969fd4cd6c219faa5ec1ff03df36d4f74c",
+    "is_password_changed": true,
+    "full_name": "خانم کرمی",
+    "role": "INTERNAL_MANAGER",
+    "role_title": "مدیر داخلی",
+    "allowed_device_id": "SYS-KARAMI-OFFICE-02",
+    "system_id": "SYS-KARAMI-OFFICE-02",
+    "system_name": "سیستم مدیریت داخلی (ویندوز 11)"
+  },
+  {
+    "user_id": "USR-003",
+    "username": "hajivand",
+    "password_salt": "b7a3d2c18490e6f532c1b98a7124c563",
+    "password_hash": "29b462651ae04eead9b9e89b9ba453b6cd8c845f69413fb19bd9a1258919ecb1",
+    "is_password_changed": true,
+    "full_name": "مهندس حاجی وند",
+    "role": "WAREHOUSE_KEEPER",
+    "role_title": "انباردار",
+    "allowed_device_id": "SYS-HAJIVAND-WH-03",
+    "system_id": "SYS-HAJIVAND-WH-03",
+    "system_name": "سیستم صنعتی انبار مرکزی (ویندوز 7)"
+  },
+  {
+    "user_id": "USR-004",
+    "username": "safaei",
+    "password_salt": "9c92382f25193ea94822d360f72a80e6",
+    "password_hash": "a9d12aa776abca0817eafd1bee9bf5563bb0728551d0b092f43c760503f7a5fa",
+    "is_password_changed": true,
+    "full_name": "خانم صفایی",
+    "role": "INTERNAL_MANAGER",
+    "role_title": "امور دفتری و بازرگانی",
+    "allowed_device_id": "SYS-SAFAEI-OFFICE-04",
+    "system_id": "SYS-SAFAEI-OFFICE-04",
+    "system_name": "سیستم اداری خانم صفایی (ویندوز 11)",
+    "updated_at": "2026-10-29T16:49:16.567Z"
+  },
+  {
+    "user_id": "USR-005",
+    "username": "hakimi",
+    "password_salt": "6aab9991f7a58cab78a8edf161c3c404",
+    "password_hash": "07c7b08ad39d05db31bfe7d8d6d4cbc235d28bd04968970965c7d87836fb598d",
+    "is_password_changed": true,
+    "full_name": "خانم حکیمی",
+    "role": "INTERNAL_MANAGER",
+    "role_title": "امور حسابداری و اسناد",
+    "allowed_device_id": "SYS-HAKIMI-OFFICE-05",
+    "system_id": "SYS-HAKIMI-OFFICE-05",
+    "system_name": "سیستم اداری خانم حکیمی (ویندوز 11)",
+    "updated_at": "2026-11-08T09:44:16.665Z"
+  }
+]
