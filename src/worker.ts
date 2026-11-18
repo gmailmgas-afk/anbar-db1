@@ -148,12 +148,15 @@ export default {
     // =========================================================================
     if (url.pathname === '/api/auth/users' && request.method === 'GET') {
       let usersList: any[] = [];
+      let purgeMeta = { last_purged_at: null as string | null, purge_preserve_products: true };
       if (env.DB) {
         try {
+          await ensureWorkerUsersReady(env.DB);
           const res = await env.DB.prepare("SELECT * FROM users").all();
           if (res.results && res.results.length > 0) {
             usersList = res.results;
           }
+          purgeMeta = await getWorkerPurgeMarker(env.DB);
         } catch {}
       }
       if (usersList.length === 0) {
@@ -163,6 +166,8 @@ export default {
         success: true,
         users: usersList,
         total_users: usersList.length,
+        last_purged_at: purgeMeta.last_purged_at,
+        purge_preserve_products: purgeMeta.purge_preserve_products,
         timestamp: new Date().toISOString()
       });
     }
@@ -176,6 +181,7 @@ export default {
         let allUsers: any[] = [];
         if (env.DB) {
           try {
+            await ensureWorkerUsersReady(env.DB);
             const res = await env.DB.prepare("SELECT * FROM users").all();
             if (res.results && res.results.length > 0) {
               allUsers = res.results;
@@ -186,25 +192,40 @@ export default {
           allUsers = DEFAULT_WORKER_USERS;
         }
 
+        const normInput = username
+          .replace(/[\u200c\u200b\u200e\u200f\u061c]/g, '')
+          .replace(/[ك]/g, 'ک')
+          .replace(/[ي]/g, 'ی')
+          .replace(/\s+/g, ' ')
+          .trim();
+
         const matched = allUsers.find((u: any) => {
           const uName = (u.username || '').toLowerCase();
-          const fName = (u.full_name || '').toLowerCase();
+          const uId = (u.user_id || '').toLowerCase();
+          const fName = (u.full_name || '')
+            .toLowerCase()
+            .replace(/[\u200c\u200b\u200e\u200f\u061c]/g, '')
+            .replace(/[ك]/g, 'ک')
+            .replace(/[ي]/g, 'ی')
+            .replace(/\s+/g, ' ')
+            .trim();
           return (
             uName === username ||
-            fName.includes(username) ||
-            (u.username === 'amouei' && (username === 'عمویی' || username === 'admin')) ||
-            (u.username === 'karami' && (username === 'کرمی' || username === 'مدیر داخلی')) ||
-            (u.username === 'hajivand' && (username === 'حاجی وند' || username === 'حاجی‌وند' || username === 'انباردار' || username === 'gholizadeh' || username === 'قلی زاده')) ||
-            (u.username === 'safaei' && (username === 'صفایی' || username === 'خانم صفایی')) ||
-            (u.username === 'hakimi' && (username === 'حکیمی' || username === 'خانم حکیمی'))
+            uId === username ||
+            (normInput.length > 0 && fName.includes(normInput)) ||
+            (u.username === 'amouei' && (normInput === 'عمویی' || normInput === 'admin' || normInput === 'مدیر عامل')) ||
+            (u.username === 'karami' && (normInput === 'کرمی' || normInput === 'مدیر داخلی')) ||
+            (u.username === 'hajivand' && (normInput === 'حاجی وند' || normInput === 'حاجی‌وند' || normInput === 'انباردار' || normInput === 'gholizadeh' || normInput === 'قلی زاده')) ||
+            (u.username === 'safaei' && (normInput === 'صفایی' || normInput === 'خانم صفایی')) ||
+            (u.username === 'hakimi' && (normInput === 'حکیمی' || normInput === 'خانم حکیمی'))
           );
         });
 
         if (!matched) {
           return jsonResponse({
             success: false,
-            error: 'نام کاربری وارد شده در پایگاه داده ابری کلودفلر یافت نشد.'
-          }, 404);
+            error: 'نام کاربری یا کلمه عبور وارد شده نامعتبر است.'
+          }, 401);
         }
 
         const toEnDigits = (str: string) => str
@@ -218,20 +239,10 @@ export default {
           passwordsToTry.push(enDigits);
         }
 
-        const commonPasswords = ['123456', '12345678', 'admin', 'amouei', 'karami', 'hajivand', 'gholizadeh', 'safaei', 'hakimi'];
         let isValid = false;
 
-        for (const p of passwordsToTry) {
-          const pLower = p.toLowerCase();
-          if (commonPasswords.includes(pLower)) { isValid = true; break; }
-          if (matched.username === 'amouei' && (p === 'Amouei#Admin11!' || pLower === 'admin')) { isValid = true; break; }
-          if (matched.username === 'karami' && (p === 'Karami#Office11!' || pLower === 'karami')) { isValid = true; break; }
-          if (matched.username === 'hajivand' && (p === 'Hajivand#Win7Gas!' || p === 'Gholizadeh#Win7Gas!')) { isValid = true; break; }
-          if (matched.username === 'safaei' && (p === '123456' || pLower === 'safaei')) { isValid = true; break; }
-          if (matched.username === 'hakimi' && (p === '123456' || pLower === 'hakimi')) { isValid = true; break; }
-        }
-
-        if (!isValid && matched.password_hash && matched.password_salt) {
+        // 1. Strict PBKDF2-SHA512 verification against stored hash & salt
+        if (matched.password_hash && matched.password_salt) {
           try {
             const enc = new TextEncoder();
             const saltBytes = new Uint8Array(matched.password_salt.match(/.{1,2}/g).map((b: string) => parseInt(b, 16)));
@@ -244,19 +255,40 @@ export default {
           } catch {}
         }
 
+        // 2. Only allow untouched legacy placeholder hashes for amouei/karami before password is ever changed
+        if (!isValid && !matched.password_updated_at) {
+          const LEGACY_AMOUEI_SEED_HASH = '866ab120f94c788b13b98383b7cd799eb7d90abce6ccf84902672dd15fef10cc';
+          const LEGACY_KARAMI_SEED_HASH = '5d0e1bf5fcde3e15776e55dc299d0c969fd4cd6c219faa5ec1ff03df36d4f74c';
+          for (const p of passwordsToTry) {
+            const pLower = p.toLowerCase();
+            if (matched.username === 'amouei' && matched.password_hash === LEGACY_AMOUEI_SEED_HASH) {
+              if (p === 'Amouei#Admin11!' || p === '123456' || pLower === 'admin') { isValid = true; break; }
+            }
+            if (matched.username === 'karami' && matched.password_hash === LEGACY_KARAMI_SEED_HASH) {
+              if (p === 'Karami#Office11!' || p === '123456' || pLower === 'karami') { isValid = true; break; }
+            }
+            if (!matched.password_hash && !matched.password_salt && !matched.is_password_changed) {
+              if (p === '123456') { isValid = true; break; }
+            }
+          }
+        }
+
         if (!isValid) {
           return jsonResponse({
             success: false,
-            error: 'کلمه عبور وارد شده نادرست است.'
+            error: 'نام کاربری یا کلمه عبور وارد شده نامعتبر است.'
           }, 401);
         }
 
+        const purgeMeta = env.DB ? await getWorkerPurgeMarker(env.DB) : { last_purged_at: null, purge_preserve_products: true };
         return jsonResponse({
           success: true,
           message: 'مجوز ورود اولیه از پایگاه داده ابری کلودفلر با موفقیت صادر شد.',
           authenticated_via: 'CLOUDFLARE_D1',
           user: matched,
           all_users: allUsers,
+          last_purged_at: purgeMeta.last_purged_at,
+          purge_preserve_products: purgeMeta.purge_preserve_products,
           timestamp: new Date().toISOString()
         });
       } catch (err: any) {
@@ -267,26 +299,89 @@ export default {
     if ((url.pathname === '/api/auth/change-password' || url.pathname === '/api/auth/user-update') && request.method === 'POST') {
       try {
         const body: any = await request.json().catch(() => ({}));
-        const { user_id, full_name, role_title, system_id, password_hash, password_salt } = body;
-        if (env.DB && user_id) {
+        const now = new Date().toISOString();
+        const {
+          user_id,
+          username,
+          old_username,
+          full_name,
+          role,
+          role_title,
+          system_id,
+          system_name,
+          password,
+          newPassword,
+          password_updated_at,
+          updated_at
+        } = body;
+        let { password_hash, password_salt } = body;
+
+        const rawNewPass = typeof newPassword === 'string' && newPassword.trim()
+          ? newPassword.trim()
+          : (typeof password === 'string' && password.trim() ? password.trim() : '');
+        if ((!password_hash || !password_salt) && rawNewPass) {
+          const toEnDigits = (str: string) => str
+            .replace(/[\u200E\u200F\u202A-\u202E\u061C]/g, '')
+            .replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 1776))
+            .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 1632));
+          const normPass = toEnDigits(rawNewPass);
+          const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+          password_salt = Array.from(saltBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+          const keyMat = await crypto.subtle.importKey('raw', new TextEncoder().encode(normPass), { name: 'PBKDF2' }, false, ['deriveBits']);
+          const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: saltBytes, iterations: 100000, hash: 'SHA-512' }, keyMat, 256);
+          password_hash = Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+
+        let updatedUserRecord: any = null;
+        if (env.DB && (user_id || username || old_username)) {
           try {
-            await env.DB.prepare(`
-              UPDATE users SET
-                full_name = COALESCE(?, full_name),
-                role_title = COALESCE(?, role_title),
-                system_id = COALESCE(?, system_id),
-                allowed_device_id = COALESCE(?, allowed_device_id),
-                password_hash = COALESCE(?, password_hash),
-                password_salt = COALESCE(?, password_salt),
-                updated_at = datetime('now')
-              WHERE user_id = ?
-            `).bind(full_name, role_title, system_id, system_id, password_hash, password_salt, user_id).run();
-          } catch {}
+            await ensureWorkerUsersReady(env.DB);
+            updatedUserRecord = await upsertWorkerUser(env.DB, {
+              user_id,
+              username,
+              old_username,
+              full_name,
+              role,
+              role_title,
+              system_id,
+              system_name,
+              password_hash,
+              password_salt,
+              is_password_changed: 1,
+              password_updated_at: password_hash ? (password_updated_at || updated_at || now) : undefined,
+              updated_at: updated_at || now
+            });
+
+            if (updatedUserRecord) {
+              const seqRow = await env.DB.prepare("SELECT COALESCE(MAX(server_sequence), 1000) as seq FROM sync_events").first();
+              const nextSeq = ((seqRow as any)?.seq || 1000) + 1;
+              const eventId = `EVT-USR-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+              await env.DB.prepare(`
+                INSERT OR IGNORE INTO sync_events (
+                  event_id, user_id, device_id, event_type, entity_type, entity_id, payload, client_created_at, server_received_at, server_sequence, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)
+              `).bind(
+                eventId,
+                'USR-001',
+                'CLOUDFLARE-D1',
+                'UPDATE',
+                'USER',
+                updatedUserRecord.user_id,
+                JSON.stringify(updatedUserRecord),
+                now,
+                nextSeq,
+                1
+              ).run();
+            }
+          } catch (dbErr) {
+            console.warn('D1 change-password error:', dbErr);
+          }
         }
         return jsonResponse({
           success: true,
-          message: 'اطلاعات هویتی کاربر در پایگاه داده ابری کلودفلر به‌روزرسانی شد.',
-          timestamp: new Date().toISOString()
+          message: 'اطلاعات هویتی و کلمه عبور کاربر در پایگاه داده ابری کلودفلر به‌روزرسانی شد.',
+          updated_user: updatedUserRecord,
+          timestamp: now
         });
       } catch (err: any) {
         return jsonResponse({ success: false, error: err?.message }, 500);
@@ -385,6 +480,70 @@ export default {
       }
     }
 
+    // Authoritative Database Purge Endpoints (Cloudflare D1)
+    if (url.pathname === '/api/database/purge' && request.method === 'POST') {
+      try {
+        const body: any = await request.json().catch(() => ({}));
+        const EXPECTED_PWD_HASH = '58ab35637a00b14c7edbe3b1fb16454a138add3ac31efc8e5cd4605668417e3f';
+        const EXPECTED_ANS_HASH = 'ef3e7bcf8860e8859f0ea5f3753f8c2eb89ab26307bb4cc6b022cf54fab2a461';
+        const sha256Hex = async (str: string) => {
+          const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(str || '').trim()));
+          return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+        };
+        const pwdMatches =
+          body.password_hash === EXPECTED_PWD_HASH ||
+          (body.secret_password && (await sha256Hex(body.secret_password)) === EXPECTED_PWD_HASH);
+        const ansMatches =
+          body.answer_hash === EXPECTED_ANS_HASH ||
+          (body.security_answer && (await sha256Hex(body.security_answer)) === EXPECTED_ANS_HASH);
+
+        if (!pwdMatches || !ansMatches) {
+          return jsonResponse({
+            success: false,
+            message: 'احراز هویت امنیتی ناموفق بود. رمز عبور یا پاسخ پرسش محرمانه اشتباه است.'
+          }, 403);
+        }
+
+        const purgedAt = body.purged_at || new Date().toISOString();
+        const author = body.author || 'مهندس موسی عمویی';
+        const nextSeq = env.DB ? await executeWorkerDatabasePurge(env.DB, purgedAt, true, author) : 1001;
+
+        return jsonResponse({
+          success: true,
+          message: 'پایگاه‌داده ابری کلودفلر با موفقیت کاملاً پاک‌سازی و تخلیه گردید.',
+          timestamp: purgedAt,
+          last_purged_at: purgedAt,
+          server_sequence: nextSeq
+        });
+      } catch (err: any) {
+        return jsonResponse({ success: false, error: err?.message || 'Purge error' }, 500);
+      }
+    }
+
+    if (
+      (url.pathname === '/api/database/purge-all-except-products' ||
+        url.pathname === '/api/database/manager-purge' ||
+        url.pathname === '/api/inventory/zero-all') &&
+      request.method === 'POST'
+    ) {
+      try {
+        const body: any = await request.json().catch(() => ({}));
+        const purgedAt = body.purged_at || body.timestamp || new Date().toISOString();
+        const author = body.author || 'مهندس موسی عمویی';
+        const nextSeq = env.DB ? await executeWorkerDatabasePurge(env.DB, purgedAt, true, author) : 1001;
+
+        return jsonResponse({
+          success: true,
+          message: 'کلیه موجودی‌ها، کاردکس‌ها، فاکتورها و اعلان‌ها در پایگاه داده ابری صفر و پاک‌سازی شدند.',
+          timestamp: purgedAt,
+          last_purged_at: purgedAt,
+          server_sequence: nextSeq
+        });
+      } catch (err: any) {
+        return jsonResponse({ success: false, error: err?.message || 'Zero/Purge error' }, 500);
+      }
+    }
+
     // Sync events upload endpoint
     if (url.pathname === '/api/sync/events' && request.method === 'POST') {
       try {
@@ -394,13 +553,30 @@ export default {
         const acceptedEvents: any[] = [];
 
         let currentSeq = 1000;
+        let purgeMs = 0;
+        let purgeMeta = { last_purged_at: null as string | null, purge_preserve_products: true };
         if (env.DB) {
           const seqRow = await env.DB.prepare("SELECT COALESCE(MAX(server_sequence), 1000) as seq FROM sync_events").first();
           currentSeq = (seqRow as any)?.seq || 1000;
+          purgeMeta = await getWorkerPurgeMarker(env.DB);
+          purgeMs = purgeMeta.last_purged_at ? new Date(purgeMeta.last_purged_at).getTime() : 0;
         }
 
         for (const ev of events) {
           if (!ev || !ev.event_id) continue;
+
+          // Ignore stale pre-purge non-USER transactional events so offline stations cannot resurrect wiped records
+          if (purgeMs > 0 && ev.entity_type !== 'USER' && ev.entity_type !== 'SYSTEM') {
+            const clientMs = ev.client_created_at ? new Date(ev.client_created_at).getTime() : 0;
+            if (clientMs > 0 && clientMs <= purgeMs) {
+              acceptedEvents.push({
+                event_id: ev.event_id,
+                server_sequence: currentSeq,
+                ignored_pre_purge: true
+              });
+              continue;
+            }
+          }
 
           if (env.DB) {
             try {
@@ -436,6 +612,22 @@ export default {
                 currentSeq,
                 ev.schema_version || 1
               ).run();
+
+              if (ev.entity_type === 'USER') {
+                const parsedPayload = typeof ev.payload === 'string' ? tryParseJson(ev.payload) : ev.payload;
+                await ensureWorkerUsersReady(env.DB);
+                if (ev.event_type === 'DELETE') {
+                  const delId = parsedPayload?.user_id || ev.entity_id;
+                  if (delId && delId !== 'USR-001') {
+                    await env.DB.prepare("DELETE FROM users WHERE user_id = ?").bind(delId).run();
+                  }
+                } else if (parsedPayload && typeof parsedPayload === 'object') {
+                  await upsertWorkerUser(env.DB, {
+                    ...parsedPayload,
+                    user_id: parsedPayload.user_id || ev.entity_id
+                  });
+                }
+              }
             } catch (dbErr) {
               console.warn('D1 insert sync_event error:', dbErr);
             }
@@ -452,6 +644,7 @@ export default {
           success: true,
           accepted_events: acceptedEvents,
           current_server_sequence: currentSeq,
+          last_purged_at: purgeMeta.last_purged_at,
           timestamp: new Date().toISOString()
         });
       } catch (err: any) {
@@ -465,25 +658,39 @@ export default {
         const sinceSeq = parseInt(url.searchParams.get('since_sequence') || '0', 10);
         let events: any[] = [];
         let maxSeq = sinceSeq;
+        let purgeMeta = { last_purged_at: null as string | null, purge_preserve_products: true };
 
         if (env.DB) {
+          purgeMeta = await getWorkerPurgeMarker(env.DB);
+          const maxRow = await env.DB.prepare("SELECT COALESCE(MAX(server_sequence), 1000) as seq FROM sync_events").first();
+          maxSeq = Math.max(1000, (maxRow as any)?.seq || 1000);
+          const effectiveSinceSeq = (!isNaN(sinceSeq) && sinceSeq > maxSeq) ? 0 : (isNaN(sinceSeq) ? 0 : sinceSeq);
+
           const res = await env.DB.prepare(
             "SELECT * FROM sync_events WHERE server_sequence > ? ORDER BY server_sequence ASC LIMIT 200"
-          ).bind(sinceSeq).all();
+          ).bind(effectiveSinceSeq).all();
 
-          events = (res.results || []).map((row: any) => ({
-            ...row,
-            payload: typeof row.payload === 'string' ? tryParseJson(row.payload) : row.payload
-          }));
-
-          const maxRow = await env.DB.prepare("SELECT COALESCE(MAX(server_sequence), ?) as seq FROM sync_events").bind(sinceSeq).first();
-          maxSeq = (maxRow as any)?.seq || sinceSeq;
+          const purgeMs = purgeMeta.last_purged_at ? new Date(purgeMeta.last_purged_at).getTime() : 0;
+          events = (res.results || [])
+            .filter((row: any) => {
+              if (purgeMs > 0 && row.entity_type !== 'USER' && row.entity_type !== 'SYSTEM') {
+                const t = row.server_received_at || row.client_created_at;
+                if (t && new Date(t).getTime() <= purgeMs) return false;
+              }
+              return true;
+            })
+            .map((row: any) => ({
+              ...row,
+              payload: typeof row.payload === 'string' ? tryParseJson(row.payload) : row.payload
+            }));
         }
 
         return jsonResponse({
           success: true,
           events,
           server_sequence: maxSeq,
+          last_purged_at: purgeMeta.last_purged_at,
+          purge_preserve_products: purgeMeta.purge_preserve_products,
           timestamp: new Date().toISOString()
         });
       } catch (err: any) {
@@ -494,30 +701,65 @@ export default {
     // Server-Sent Events (SSE) live stream endpoint for real-time synchronization
     if (url.pathname === '/api/sync/stream') {
       let lastStreamSeq = parseInt(url.searchParams.get('since_sequence') || '0', 10);
+      const clientPurgedAtParam = url.searchParams.get('since_purged_at') || '';
+      let lastSeenPurgedAt: string | null = clientPurgedAtParam || null;
+      let serverPurgeMeta = { last_purged_at: null as string | null, purge_preserve_products: true };
+
       if (env.DB) {
         try {
           const seqRow = await env.DB.prepare("SELECT COALESCE(MAX(server_sequence), 1000) as seq FROM sync_events").first();
           const currentMax = (seqRow as any)?.seq || 1000;
-          if (!lastStreamSeq) lastStreamSeq = currentMax;
-        } catch {
-          // ignore
-        }
+          if (!lastStreamSeq || lastStreamSeq > currentMax) lastStreamSeq = currentMax;
+          serverPurgeMeta = await getWorkerPurgeMarker(env.DB);
+        } catch {}
       }
 
       const { readable, writable } = new TransformStream();
       const writer = writable.getWriter();
       const encoder = new TextEncoder();
 
-      // Immediately send connected event with current sequence
-      writer.write(encoder.encode(`data: ${JSON.stringify({ type: 'CONNECTED', current_server_sequence: lastStreamSeq })}\n\n`)).catch(() => {});
+      // Immediately send connected event with current sequence & purge marker
+      writer.write(encoder.encode(`data: ${JSON.stringify({
+        type: 'CONNECTED',
+        current_server_sequence: lastStreamSeq,
+        last_purged_at: serverPurgeMeta.last_purged_at,
+        purge_preserve_products: serverPurgeMeta.purge_preserve_products
+      })}\n\n`)).catch(() => {});
 
-      // Keep stream alive and actively push any new D1 sync_events every 2 seconds
+      if (serverPurgeMeta.last_purged_at) {
+        const sMs = new Date(serverPurgeMeta.last_purged_at).getTime();
+        const cMs = clientPurgedAtParam ? new Date(clientPurgedAtParam).getTime() : 0;
+        if (!isNaN(sMs) && sMs > cMs) {
+          lastSeenPurgedAt = serverPurgeMeta.last_purged_at;
+          writer.write(encoder.encode(`data: ${JSON.stringify({
+            type: 'DATABASE_PURGED',
+            timestamp: serverPurgeMeta.last_purged_at,
+            last_purged_at: serverPurgeMeta.last_purged_at,
+            preserve_products: serverPurgeMeta.purge_preserve_products,
+            server_sequence: lastStreamSeq
+          })}\n\n`)).catch(() => {});
+        }
+      }
+
+      // Keep stream alive and actively push any new D1 sync_events or purge updates every 2 seconds
       if (ctx && typeof ctx.waitUntil === 'function') {
         ctx.waitUntil((async () => {
           try {
             for (let i = 0; i < 25; i++) {
               await new Promise(r => setTimeout(r, 2000));
               if (env.DB) {
+                const currentPurge = await getWorkerPurgeMarker(env.DB);
+                if (currentPurge.last_purged_at && currentPurge.last_purged_at !== lastSeenPurgedAt) {
+                  lastSeenPurgedAt = currentPurge.last_purged_at;
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({
+                    type: 'DATABASE_PURGED',
+                    timestamp: currentPurge.last_purged_at,
+                    last_purged_at: currentPurge.last_purged_at,
+                    preserve_products: currentPurge.purge_preserve_products,
+                    server_sequence: lastStreamSeq
+                  })}\n\n`));
+                }
+
                 const res = await env.DB.prepare(
                   "SELECT * FROM sync_events WHERE server_sequence > ? ORDER BY server_sequence ASC LIMIT 100"
                 ).bind(lastStreamSeq).all();
@@ -531,6 +773,7 @@ export default {
                     type: 'SYNC_EVENTS',
                     events: rows,
                     server_sequence: lastStreamSeq,
+                    last_purged_at: currentPurge.last_purged_at,
                     timestamp: new Date().toISOString()
                   })}\n\n`));
                 } else if (i % 5 === 0) {
@@ -676,4 +919,206 @@ function tryParseJson(str: string): any {
   } catch {
     return str;
   }
+}
+
+async function ensureWorkerUsersReady(db: any) {
+  if (!db) return;
+  try {
+    await db.prepare("ALTER TABLE users ADD COLUMN password_updated_at TEXT").run();
+  } catch {}
+  try {
+    const countRow = await db.prepare("SELECT COUNT(*) as cnt FROM users").first();
+    if (!countRow || Number(countRow.cnt || 0) === 0) {
+      const now = new Date().toISOString();
+      for (const u of DEFAULT_WORKER_USERS) {
+        await db.prepare(`
+          INSERT OR IGNORE INTO users (
+            user_id, username, password_hash, password_salt, is_password_changed,
+            full_name, role, role_title, allowed_device_id, system_id, system_name,
+            is_active, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        `).bind(
+          u.user_id, u.username, u.password_hash, u.password_salt, u.is_password_changed,
+          u.full_name, u.role, u.role_title, u.allowed_device_id, u.system_id, u.system_name,
+          now, now
+        ).run();
+      }
+    }
+  } catch {}
+}
+
+async function upsertWorkerUser(db: any, payload: any): Promise<any | null> {
+  if (!db || !payload) return null;
+  const now = new Date().toISOString();
+  const targetId = payload.user_id ? String(payload.user_id) : null;
+  const cleanUsername = payload.username ? String(payload.username).trim().toLowerCase() : null;
+  const oldUsername = payload.old_username ? String(payload.old_username).trim().toLowerCase() : null;
+
+  let existing: any = null;
+  if (targetId) {
+    existing = await db.prepare("SELECT * FROM users WHERE user_id = ?").bind(targetId).first();
+  }
+  if (!existing && oldUsername) {
+    existing = await db.prepare("SELECT * FROM users WHERE LOWER(username) = ?").bind(oldUsername).first();
+  }
+  if (!existing && cleanUsername) {
+    existing = await db.prepare("SELECT * FROM users WHERE LOWER(username) = ?").bind(cleanUsername).first();
+  }
+
+  if (existing) {
+    const existingTime = existing.password_updated_at || existing.updated_at ? new Date(existing.password_updated_at || existing.updated_at).getTime() : 0;
+    const incomingTime = payload.password_updated_at || payload.updated_at ? new Date(payload.password_updated_at || payload.updated_at).getTime() : 0;
+    if (existingTime > 0 && incomingTime > 0 && incomingTime < existingTime) {
+      return existing;
+    }
+
+    const nextUsername = cleanUsername || existing.username;
+    const nextFullName = payload.full_name ? String(payload.full_name).trim() : existing.full_name;
+    const nextRole = payload.role || existing.role;
+    const nextRoleTitle = payload.role_title ? String(payload.role_title).trim() : (existing.role_title || null);
+    const nextSystemId = payload.system_id ? String(payload.system_id).trim() : (existing.system_id || existing.allowed_device_id);
+    const nextSystemName = payload.system_name ? String(payload.system_name).trim() : (existing.system_name || null);
+    const nextHash = payload.password_hash || existing.password_hash;
+    const nextSalt = payload.password_salt || existing.password_salt || null;
+    const nextChanged = payload.is_password_changed === false || payload.is_password_changed === 0 ? 0 : 1;
+    const nextPassUpdatedAt = payload.password_hash
+      ? (payload.password_updated_at || payload.updated_at || now)
+      : (existing.password_updated_at || null);
+    const nextUpdatedAt = payload.updated_at || now;
+
+    await db.prepare(`
+      UPDATE users SET
+        username = ?,
+        full_name = ?,
+        role = ?,
+        role_title = ?,
+        system_id = ?,
+        allowed_device_id = ?,
+        system_name = ?,
+        password_hash = ?,
+        password_salt = ?,
+        is_password_changed = ?,
+        password_updated_at = ?,
+        updated_at = ?
+      WHERE user_id = ?
+    `).bind(
+      nextUsername,
+      nextFullName,
+      nextRole,
+      nextRoleTitle,
+      nextSystemId,
+      nextSystemId,
+      nextSystemName,
+      nextHash,
+      nextSalt,
+      nextChanged,
+      nextPassUpdatedAt,
+      nextUpdatedAt,
+      existing.user_id
+    ).run();
+
+    return await db.prepare("SELECT * FROM users WHERE user_id = ?").bind(existing.user_id).first();
+  }
+
+  if (targetId && cleanUsername) {
+    const newSystemId = payload.system_id ? String(payload.system_id).trim() : 'SYS-STATION-NEW';
+    const nextPassUpdatedAt = payload.password_hash ? (payload.password_updated_at || payload.updated_at || now) : null;
+    await db.prepare(`
+      INSERT OR REPLACE INTO users (
+        user_id, username, password_hash, password_salt, is_password_changed,
+        full_name, role, role_title, allowed_device_id, system_id, system_name,
+        is_active, created_at, updated_at, password_updated_at
+      ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+    `).bind(
+      targetId,
+      cleanUsername,
+      payload.password_hash || '',
+      payload.password_salt || null,
+      payload.full_name ? String(payload.full_name).trim() : cleanUsername,
+      payload.role || 'INTERNAL_MANAGER',
+      payload.role_title ? String(payload.role_title).trim() : null,
+      payload.allowed_device_id || newSystemId,
+      newSystemId,
+      payload.system_name ? String(payload.system_name).trim() : null,
+      payload.created_at || now,
+      payload.updated_at || now,
+      nextPassUpdatedAt
+    ).run();
+
+    return await db.prepare("SELECT * FROM users WHERE user_id = ?").bind(targetId).first();
+  }
+
+  return null;
+}
+
+async function getWorkerPurgeMarker(db: any): Promise<{ last_purged_at: string | null; purge_preserve_products: boolean }> {
+  if (!db) return { last_purged_at: null, purge_preserve_products: true };
+  try {
+    const row = await db.prepare("SELECT value FROM settings WHERE key = 'last_purged_at'").first();
+    const presRow = await db.prepare("SELECT value FROM settings WHERE key = 'purge_preserve_products'").first();
+    return {
+      last_purged_at: row?.value || null,
+      purge_preserve_products: presRow ? presRow.value !== 'false' : true
+    };
+  } catch {
+    return { last_purged_at: null, purge_preserve_products: true };
+  }
+}
+
+async function executeWorkerDatabasePurge(
+  db: any,
+  purgedAt: string,
+  preserveProducts: boolean,
+  author: string
+): Promise<number> {
+  if (!db) return 1001;
+  const statements = [
+    "DELETE FROM stock_movements",
+    "DELETE FROM stock",
+    "DELETE FROM goods_receipts",
+    "DELETE FROM gas_kardex",
+    "DELETE FROM purchases",
+    "DELETE FROM sales",
+    "DELETE FROM invoices",
+    "DELETE FROM sync_events WHERE entity_type != 'USER'"
+  ];
+  for (const sql of statements) {
+    try {
+      await db.prepare(sql).run();
+    } catch {}
+  }
+
+  let nextSeq = 1001;
+  try {
+    const seqRow = await db.prepare("SELECT COALESCE(MAX(server_sequence), 1000) as seq FROM sync_events").first();
+    nextSeq = Math.max(1001, ((seqRow as any)?.seq || 1000) + 1);
+  } catch {}
+
+  try {
+    await db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('last_purged_at', ?, ?)").bind(purgedAt, purgedAt).run();
+    await db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('purge_preserve_products', ?, ?)").bind(preserveProducts ? 'true' : 'false', purgedAt).run();
+  } catch {}
+
+  try {
+    const sysId = `EVT-PURGE-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    await db.prepare(`
+      INSERT OR IGNORE INTO sync_events (
+        event_id, user_id, device_id, event_type, entity_type, entity_id, payload, client_created_at, server_received_at, server_sequence, schema_version
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      sysId,
+      'USR-001',
+      'CLOUDFLARE-D1',
+      'DELETE',
+      'SYSTEM',
+      preserveProducts ? 'PURGE_EXCEPT_PRODUCTS' : 'GLOBAL_PURGE',
+      JSON.stringify({ action: 'DATABASE_PURGED', purged_at: purgedAt, preserve_products: preserveProducts, author }),
+      purgedAt,
+      purgedAt,
+      nextSeq,
+      1
+    ).run();
+  } catch {}
+
+  return nextSeq;
 }

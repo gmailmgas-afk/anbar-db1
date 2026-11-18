@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('desktopAPI', {
   query: (sql, params) => ipcRenderer.invoke('sqlite:query', sql, params),
   execute: (sql, params) => ipcRenderer.invoke('sqlite:execute', sql, params),
   recordLocalEvent: (syncEvent) => ipcRenderer.invoke('sqlite:record-event', syncEvent),
+  purgeLocalDatabase: (options) => ipcRenderer.invoke('sqlite:purge', options),
   saveBackupToFile: (options) => ipcRenderer.invoke('sqlite:backup', options),
   saveJsonFile: (fileName, content) => ipcRenderer.invoke('system:save-json', { fileName, content }),
 

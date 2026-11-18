@@ -89,6 +89,7 @@ export interface User {
   password_hash?: string;
   password_salt?: string;
   is_password_changed?: boolean;
+  password_updated_at?: string;
   full_name: string;
   role: UserRole;
   role_title?: string;
@@ -711,8 +712,35 @@ export type EntityType =
   | 'GAS_PRODUCTION_KARDEX'
   | 'GOODS_RECEIPT'
   | 'CYLINDER_VALVE_INSPECTION'
+  | 'NOTIFICATION'
+  | 'SYSTEM'
   | 'SETTING'
   | 'USER';
+
+export type NotificationCategory =
+  | 'KARDEX_REPAIR'
+  | 'KARDEX_PRODUCTION'
+  | 'INVENTORY'
+  | 'INVOICE'
+  | 'INSPECTION'
+  | 'USER'
+  | 'SYSTEM';
+
+export interface AppNotification {
+  notification_id: string;
+  title: string;
+  message: string;
+  level: 'info' | 'success' | 'warning' | 'error';
+  category: NotificationCategory;
+  target_tab?: string;
+  actor_user_id?: string;
+  actor_name?: string;
+  device_id?: string;
+  entity_type?: EntityType | string;
+  entity_id?: string;
+  read_by: string[];
+  created_at: string;
+}
 
 export type EventType =
   | 'CREATE'
@@ -805,6 +833,7 @@ export interface DesktopAPI {
   query: (sql: string, params?: any[]) => Promise<any[]>;
   execute: (sql: string, params?: any[]) => Promise<{ success: boolean }>;
   recordLocalEvent: (event: any) => Promise<{ success: boolean; event_id: string }>;
+  purgeLocalDatabase?: (options?: { preserveProducts?: boolean; purgedAt?: string }) => Promise<{ success: boolean }>;
   saveBackupToFile: (options?: any) => Promise<{ success: boolean; destinationPath?: string; cancelled?: boolean }>;
   saveJsonFile?: (fileName: string, content: string | object) => Promise<{ success: boolean; filePath?: string; canceled?: boolean; error?: string }>;
   getBootLogs?: () => Promise<string[]>;

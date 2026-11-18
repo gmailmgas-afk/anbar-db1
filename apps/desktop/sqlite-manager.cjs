@@ -163,6 +163,10 @@ async function initDatabase(electronApp, targetEnv = 'OFFICE_WIN11') {
         `);
       }
 
+      try {
+        activeDb.run("ALTER TABLE users ADD COLUMN password_updated_at TEXT");
+      } catch {}
+
       // Initial settings and metadata
       const now = new Date().toISOString();
       activeDb.run(
@@ -257,6 +261,9 @@ async function initDatabase(electronApp, targetEnv = 'OFFICE_WIN11') {
           CREATE INDEX IF NOT EXISTS idx_goods_receipts_form_number ON goods_receipts(form_number);
           CREATE INDEX IF NOT EXISTS idx_goods_receipts_entry ON goods_receipts(entry_id);
         `);
+        try {
+          activeDb.run("ALTER TABLE users ADD COLUMN password_updated_at TEXT");
+        } catch {}
         const res = activeDb.exec("SELECT value FROM settings WHERE key = 'schema_version'");
         const version = res.length > 0 && res[0].values.length > 0 ? res[0].values[0][0] : '1';
         console.log(`[SQLite Manager] Verified database schema version: ${version}`);
@@ -343,7 +350,7 @@ function recordLocalEvent(event, extraUpdates = null) {
 
     // 1. Insert into sync_events
     activeDb.run(
-      `INSERT INTO sync_events (event_id, user_id, device_id, event_type, entity_type, entity_id, payload, client_created_at, schema_version)
+      `INSERT OR IGNORE INTO sync_events (event_id, user_id, device_id, event_type, entity_type, entity_id, payload, client_created_at, schema_version)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         event.event_id,
@@ -360,7 +367,7 @@ function recordLocalEvent(event, extraUpdates = null) {
 
     // 2. Insert into local sync_queue (Outbox)
     activeDb.run(
-      `INSERT INTO sync_queue (event_id, status, retry_count, created_at, payload)
+      `INSERT OR IGNORE INTO sync_queue (event_id, status, retry_count, created_at, payload)
        VALUES (?, 'PENDING', 0, ?, ?)`,
       [event.event_id, now, JSON.stringify(event)]
     );
@@ -464,30 +471,72 @@ function recordLocalEvent(event, extraUpdates = null) {
       }
     } else if (event.entity_type === 'USER' && event.payload) {
       const p = event.payload;
+      const targetUserId = p.user_id || event.entity_id;
       if (event.event_type === 'DELETE') {
-        activeDb.run(`DELETE FROM users WHERE user_id = ?`, [p.user_id || event.entity_id]);
+        if (targetUserId !== 'USR-001') {
+          activeDb.run(`DELETE FROM users WHERE user_id = ?`, [targetUserId]);
+        }
       } else {
-        activeDb.run(`
-          INSERT OR REPLACE INTO users (
-            user_id, username, password_hash, password_salt, is_password_changed,
-            full_name, role, role_title, allowed_device_id, system_id, system_name,
-            is_active, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-          p.user_id || event.entity_id,
-          (p.username || '').toLowerCase().trim(),
-          p.password_hash || '',
-          p.password_salt || '',
-          p.is_password_changed !== false ? 1 : 0,
-          p.full_name || '',
-          p.role || 'INTERNAL_MANAGER',
-          p.role_title || '',
-          p.allowed_device_id || p.system_id || activeDeviceId,
-          p.system_id || activeDeviceId,
-          p.system_name || '',
-          p.is_active !== false ? 1 : 0,
-          now
-        ]);
+        let existingRow = null;
+        try {
+          const checkStmt = activeDb.prepare(
+            `SELECT password_hash, password_salt, password_updated_at, updated_at FROM users WHERE user_id = ?`
+          );
+          checkStmt.bind([targetUserId]);
+          if (checkStmt.step()) {
+            existingRow = checkStmt.getAsObject();
+          }
+          checkStmt.free();
+        } catch {}
+
+        const existingTime = existingRow && (existingRow.password_updated_at || existingRow.updated_at)
+          ? new Date(existingRow.password_updated_at || existingRow.updated_at).getTime()
+          : 0;
+        const incomingTimeStr = p.password_updated_at || p.updated_at || event.client_created_at;
+        const incomingTime = incomingTimeStr ? new Date(incomingTimeStr).getTime() : 0;
+
+        if (!(existingTime > 0 && incomingTime > 0 && incomingTime < existingTime)) {
+          const resolvedHash = p.password_hash || (existingRow ? existingRow.password_hash : '') || '';
+          const resolvedSalt = p.password_salt || (existingRow ? existingRow.password_salt : '') || '';
+          const resolvedPassUpdatedAt = p.password_hash
+            ? (p.password_updated_at || p.updated_at || now)
+            : (existingRow ? existingRow.password_updated_at : null);
+
+          activeDb.run(`
+            INSERT OR REPLACE INTO users (
+              user_id, username, password_hash, password_salt, is_password_changed,
+              full_name, role, role_title, allowed_device_id, system_id, system_name,
+              is_active, updated_at, password_updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `, [
+            targetUserId,
+            (p.username || '').toLowerCase().trim(),
+            resolvedHash,
+            resolvedSalt,
+            p.is_password_changed !== false ? 1 : 0,
+            p.full_name || '',
+            p.role || 'INTERNAL_MANAGER',
+            p.role_title || '',
+            p.allowed_device_id || p.system_id || activeDeviceId,
+            p.system_id || activeDeviceId,
+            p.system_name || '',
+            p.is_active !== false ? 1 : 0,
+            p.updated_at || now,
+            resolvedPassUpdatedAt
+          ]);
+        }
+      }
+    } else if (event.entity_type === 'SYSTEM' && event.payload) {
+      const action = event.payload.action || '';
+      if (action === 'DATABASE_PURGED' || action === 'INVENTORY_ZEROED') {
+        const purgedAt = event.payload.purged_at || now;
+        activeDb.run(`DELETE FROM stock_movements`);
+        activeDb.run(`DELETE FROM goods_receipts`);
+        activeDb.run(`DELETE FROM audit_logs WHERE entity_type NOT IN ('USER', 'SYSTEM')`);
+        activeDb.run(`DELETE FROM sync_events WHERE entity_type NOT IN ('USER', 'SYSTEM') AND event_id != ?`, [event.event_id]);
+        activeDb.run(`DELETE FROM sync_queue WHERE event_id IN (SELECT event_id FROM sync_events WHERE entity_type NOT IN ('USER', 'SYSTEM')) AND event_id != ?`, [event.event_id]);
+        activeDb.run(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('last_purged_at', ?, ?)`, [purgedAt, now]);
+        activeDb.run(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('purge_preserve_products', ?, ?)`, [event.payload.preserve_products !== false ? 'true' : 'false', now]);
       }
     }
 
@@ -497,6 +546,35 @@ function recordLocalEvent(event, extraUpdates = null) {
   } catch (err) {
     activeDb.exec('ROLLBACK;');
     console.error('[SQLite recordLocalEvent Error]', err);
+    throw err;
+  }
+}
+
+// 9b. Authoritative Purge of Local SQLite Store (preserving users & product catalog)
+function purgeLocalDatabase(options = {}) {
+  if (!activeDb) return { success: false, message: 'پایگاه داده باز نیست' };
+  const preserveProducts = options.preserveProducts !== false;
+  const purgedAt = options.purgedAt || new Date().toISOString();
+  const now = new Date().toISOString();
+
+  activeDb.exec('BEGIN TRANSACTION;');
+  try {
+    activeDb.run(`DELETE FROM stock_movements`);
+    activeDb.run(`DELETE FROM goods_receipts`);
+    activeDb.run(`DELETE FROM audit_logs WHERE entity_type NOT IN ('USER', 'SYSTEM')`);
+    activeDb.run(`DELETE FROM sync_queue WHERE event_id NOT IN (SELECT event_id FROM sync_events WHERE entity_type = 'USER')`);
+    activeDb.run(`DELETE FROM sync_events WHERE entity_type NOT IN ('USER', 'SYSTEM')`);
+    if (!preserveProducts) {
+      activeDb.run(`DELETE FROM products`);
+    }
+    activeDb.run(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('last_purged_at', ?, ?)`, [purgedAt, now]);
+    activeDb.run(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('purge_preserve_products', ?, ?)`, [preserveProducts ? 'true' : 'false', now]);
+    activeDb.exec('COMMIT;');
+    flushDatabaseToDisk();
+    return { success: true, last_purged_at: purgedAt, preserveProducts };
+  } catch (err) {
+    activeDb.exec('ROLLBACK;');
+    console.error('[SQLite purgeLocalDatabase Error]', err);
     throw err;
   }
 }
@@ -536,6 +614,7 @@ module.exports = {
   query,
   execute,
   recordLocalEvent,
+  purgeLocalDatabase,
   backupDatabase,
   hashPassword,
   flushDatabaseToDisk

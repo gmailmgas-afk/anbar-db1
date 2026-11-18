@@ -424,9 +424,17 @@ export const GasProductionKardexView: React.FC<GasProductionKardexViewProps> = (
   useEffect(() => {
     refreshLocalState();
     const handleUpdated = () => refreshLocalState();
+    const handlePurged = () => {
+      setAllEntries([]);
+      onRefresh?.();
+    };
     window.addEventListener('mgas:db_refreshed', handleUpdated);
-    return () => window.removeEventListener('mgas:db_refreshed', handleUpdated);
-  }, [refreshLocalState]);
+    window.addEventListener('mgas:database_purged', handlePurged);
+    return () => {
+      window.removeEventListener('mgas:db_refreshed', handleUpdated);
+      window.removeEventListener('mgas:database_purged', handlePurged);
+    };
+  }, [refreshLocalState, onRefresh]);
 
   // Real-time stock map for each product and its sub-variants
   const subVariantStockMap = useMemo(() => {

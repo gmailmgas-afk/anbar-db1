@@ -13,6 +13,7 @@ import { safeGetCookie, safeSetCookie, safeRemoveCookie } from './browserCompati
 export interface UserAuthCredentials {
   username: string;
   password?: string;
+  password_hash?: string;
   authenticated_at?: string;
 }
 
@@ -21,11 +22,15 @@ const AUTH_COOKIE_NAME = 'mgas_user_auth';
 /**
  * Save user credentials in client cookie with memory fallback.
  */
-export function saveAuthCookie(username: string, password: string = ''): void {
+export function saveAuthCookie(username: string, password: string = '', passwordHash?: string): void {
   try {
+    const existing = getAuthCookie();
+    const cleanUsername = username.trim();
+    const resolvedPassword = password ? password.trim() : (existing && existing.username.toLowerCase() === cleanUsername.toLowerCase() ? (existing.password || '') : '');
     const payload: UserAuthCredentials = {
-      username: username.trim(),
-      password: password ? password.trim() : '',
+      username: cleanUsername,
+      password: resolvedPassword,
+      password_hash: passwordHash || (existing && existing.username.toLowerCase() === cleanUsername.toLowerCase() ? existing.password_hash : undefined),
       authenticated_at: new Date().toISOString()
     };
     const encoded = encodeURIComponent(JSON.stringify(payload));
@@ -49,6 +54,7 @@ export function getAuthCookie(): UserAuthCredentials | null {
         return {
           username: parsed.username,
           password: parsed.password || '',
+          password_hash: parsed.password_hash,
           authenticated_at: parsed.authenticated_at
         };
       }

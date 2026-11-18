@@ -35,6 +35,7 @@ static SOCKET g_sse_clients[MAX_SSE_CLIENTS] = {0};
 static int g_sse_client_count = 0;
 static CRITICAL_SECTION g_sse_cs;
 static volatile LONG g_last_known_sequence = 0;
+static char g_last_purged_at[64] = {0};
 
 /* Convert wide string to UTF-8 */
 static void wchar_to_utf8(const wchar_t* wstr, char* utf8_buf, size_t buf_size) {
@@ -223,6 +224,38 @@ static int extract_json_int_field(const char* json, const char* key, int default
     return default_val;
 }
 
+/* Extract quoted string JSON field value dynamically (ignores null) */
+static int extract_json_string_field(const char* json, const char* key, char* out_buf, size_t out_max) {
+    if (!out_buf || out_max == 0) return 0;
+    out_buf[0] = '\0';
+    if (!json || !key) return 0;
+    const char* pos = strstr(json, key);
+    if (!pos) return 0;
+    pos += strlen(key);
+    while (*pos && (*pos == ' ' || *pos == '\t' || *pos == ':' || *pos == '\r' || *pos == '\n')) {
+        pos++;
+    }
+    if (*pos != '"') return 0;
+    pos++;
+    size_t i = 0;
+    while (*pos && *pos != '"' && i < out_max - 1) {
+        if (*pos == '\\' && pos[1]) {
+            pos++;
+        }
+        out_buf[i++] = *pos++;
+    }
+    out_buf[i] = '\0';
+    return (i > 0) ? 1 : 0;
+}
+
+static void get_utc_iso_timestamp(char* buf, size_t size) {
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    snprintf(buf, size, "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+        (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
+        (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond, (unsigned)st.wMilliseconds);
+}
+
 /* Extract highest server_sequence from either server_sequence or current_server_sequence */
 static int extract_sequence_from_json(const char* json, int fallback_val) {
     int s1 = extract_json_int_field(json, "\"server_sequence\"", -1);
@@ -385,26 +418,98 @@ static int parse_since_sequence_param(const char* full_url) {
     return atoi(p + 15);
 }
 
+static void parse_query_string_param(const char* full_url, const char* key, char* out, size_t out_max) {
+    if (!out || out_max == 0) return;
+    out[0] = '\0';
+    if (!full_url || !key) return;
+    const char* p = strstr(full_url, key);
+    if (!p) return;
+    p += strlen(key);
+    if (*p != '=') return;
+    p++;
+    char encoded[256];
+    size_t i = 0;
+    while (*p && *p != '&' && *p != ' ' && i < sizeof(encoded) - 1) {
+        encoded[i++] = *p++;
+    }
+    encoded[i] = '\0';
+    url_decode(out, encoded, out_max);
+}
+
+static void broadcast_sse_purge(const char* purged_at, const char* type_name, int preserve_products) {
+    if (!purged_at || !purged_at[0]) return;
+    EnterCriticalSection(&g_sse_cs);
+    if (g_sse_client_count > 0) {
+        char broadcast_frame[512];
+        int frame_len = snprintf(broadcast_frame, sizeof(broadcast_frame),
+            "data: {\"type\":\"%s\",\"preserve_products\":%s,\"last_purged_at\":\"%s\",\"timestamp\":\"%s\",\"server_sequence\":%ld}\n\n",
+            type_name,
+            preserve_products ? "true" : "false",
+            purged_at,
+            purged_at,
+            (long)g_last_known_sequence);
+        for (int i = 0; i < g_sse_client_count; i++) {
+            if (g_sse_clients[i] != INVALID_SOCKET) {
+                send(g_sse_clients[i], broadcast_frame, frame_len, 0);
+            }
+        }
+    }
+    LeaveCriticalSection(&g_sse_cs);
+}
+
+static void update_local_purge_marker_and_cache(const char* purged_at, int seq) {
+    if (!purged_at || !purged_at[0]) return;
+    EnterCriticalSection(&g_cache_cs);
+    if (!g_last_purged_at[0] || strcmp(purged_at, g_last_purged_at) > 0) {
+        snprintf(g_last_purged_at, sizeof(g_last_purged_at), "%s", purged_at);
+    }
+    if (seq > g_last_known_sequence) g_last_known_sequence = seq;
+    LeaveCriticalSection(&g_cache_cs);
+
+    char clean_cache[512];
+    int len = snprintf(clean_cache, sizeof(clean_cache),
+        "{\"success\":true,\"events\":[],\"server_sequence\":%ld,\"last_purged_at\":\"%s\",\"purge_preserve_products\":true}\n",
+        (long)g_last_known_sequence,
+        g_last_purged_at);
+    save_sync_cache(clean_cache, len);
+}
+
 static void handle_sse_live_stream(SOCKET client, const char* full_url) {
     int last_seq = parse_since_sequence_param(full_url);
     int initial_seq = (int)g_last_known_sequence;
     if (last_seq > initial_seq) initial_seq = last_seq;
 
-    log_write("SSE", "Live stream connected (since_sequence=%d)", last_seq);
+    char client_purged_at[64] = {0};
+    parse_query_string_param(full_url, "since_purged_at", client_purged_at, sizeof(client_purged_at));
 
-    char sse_hdr[512];
+    log_write("SSE", "Live stream connected (since_sequence=%d, since_purged_at=%s)", last_seq, client_purged_at);
+
+    char sse_hdr[768];
     int hdr_len = snprintf(sse_hdr, sizeof(sse_hdr),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream; charset=utf-8\r\n"
         "Cache-Control: no-cache, no-transform\r\n"
         "Connection: keep-alive\r\n"
         "Access-Control-Allow-Origin: *\r\n\r\n"
-        "data: {\"type\":\"CONNECTED\",\"current_server_sequence\":%d}\n\n",
-        initial_seq);
+        "data: {\"type\":\"CONNECTED\",\"current_server_sequence\":%d,\"last_purged_at\":\"%s\"}\n\n",
+        initial_seq,
+        g_last_purged_at);
 
     if (send(client, sse_hdr, hdr_len, 0) <= 0) {
         closesocket(client);
         return;
+    }
+
+    if (g_last_purged_at[0] && strcmp(g_last_purged_at, client_purged_at) > 0) {
+        char purge_frame[512];
+        int plen = snprintf(purge_frame, sizeof(purge_frame),
+            "data: {\"type\":\"DATABASE_PURGED\",\"preserve_products\":true,\"last_purged_at\":\"%s\",\"timestamp\":\"%s\",\"server_sequence\":%d}\n\n",
+            g_last_purged_at, g_last_purged_at, initial_seq);
+        if (send(client, purge_frame, plen, 0) <= 0) {
+            closesocket(client);
+            return;
+        }
+        snprintf(client_purged_at, sizeof(client_purged_at), "%s", g_last_purged_at);
     }
 
     EnterCriticalSection(&g_sse_cs);
@@ -432,6 +537,27 @@ static void handle_sse_live_stream(SOCKET client, const char* full_url) {
                 int new_seq = extract_sequence_from_json(cloud_buf, last_seq);
                 if (new_seq > last_seq) last_seq = new_seq;
                 if (new_seq > g_last_known_sequence) g_last_known_sequence = new_seq;
+
+                char remote_purged_at[64] = {0};
+                if (extract_json_string_field(cloud_buf, "\"last_purged_at\"", remote_purged_at, sizeof(remote_purged_at))) {
+                    if (strcmp(remote_purged_at, g_last_purged_at) > 0) {
+                        update_local_purge_marker_and_cache(remote_purged_at, last_seq);
+                    }
+                    if (strcmp(remote_purged_at, client_purged_at) > 0) {
+                        int plen = snprintf(sse_frame, CLOUD_RESPONSE_MAX + 512,
+                            "data: {\"type\":\"DATABASE_PURGED\",\"preserve_products\":true,\"last_purged_at\":\"%s\",\"timestamp\":\"%s\",\"server_sequence\":%d}\n\n",
+                            remote_purged_at, remote_purged_at, last_seq);
+                        if (send(client, sse_frame, plen, 0) <= 0) break;
+                        snprintf(client_purged_at, sizeof(client_purged_at), "%s", remote_purged_at);
+                        log_write("SSE", "Pushed DATABASE_PURGED marker (%s)", remote_purged_at);
+                    }
+                } else if (g_last_purged_at[0] && strcmp(g_last_purged_at, client_purged_at) > 0) {
+                    int plen = snprintf(sse_frame, CLOUD_RESPONSE_MAX + 512,
+                        "data: {\"type\":\"DATABASE_PURGED\",\"preserve_products\":true,\"last_purged_at\":\"%s\",\"timestamp\":\"%s\",\"server_sequence\":%d}\n\n",
+                        g_last_purged_at, g_last_purged_at, last_seq);
+                    if (send(client, sse_frame, plen, 0) <= 0) break;
+                    snprintf(client_purged_at, sizeof(client_purged_at), "%s", g_last_purged_at);
+                }
 
                 if (last_seq == 0 || has_nonempty_events(cloud_buf)) {
                     if (strstr(query_path, "since_sequence=0") != NULL && strlen(cloud_buf) > 10) {
@@ -623,6 +749,12 @@ static void handle_client(SOCKET client) {
         if (cloud_resp && relay_to_central_cloud("GET", full_url, NULL, 0, cloud_resp, CLOUD_RESPONSE_MAX)) {
             int new_seq = extract_sequence_from_json(cloud_resp, (int)g_last_known_sequence);
             if (new_seq > g_last_known_sequence) g_last_known_sequence = new_seq;
+            char remote_purged_at[64] = {0};
+            if (extract_json_string_field(cloud_resp, "\"last_purged_at\"", remote_purged_at, sizeof(remote_purged_at))) {
+                if (strcmp(remote_purged_at, g_last_purged_at) > 0) {
+                    update_local_purge_marker_and_cache(remote_purged_at, new_seq);
+                }
+            }
             if (since_seq == 0 && strlen(cloud_resp) > 10) {
                 save_sync_cache(cloud_resp, (int)strlen(cloud_resp));
             }
@@ -642,10 +774,11 @@ static void handle_client(SOCKET client) {
             free(cloud_resp);
         }
 
-        char fallback_json[256];
+        char fallback_json[320];
         snprintf(fallback_json, sizeof(fallback_json),
-            "{\"success\":true,\"events\":[],\"server_sequence\":%ld,\"offline_fallback\":true}\n",
-            (long)g_last_known_sequence);
+            "{\"success\":true,\"events\":[],\"server_sequence\":%ld,\"last_purged_at\":\"%s\",\"offline_fallback\":true}\n",
+            (long)g_last_known_sequence,
+            g_last_purged_at);
         free(req_buf);
         send_json_response(client, fallback_json);
         return;
@@ -734,68 +867,98 @@ static void handle_client(SOCKET client) {
     /* 3d2. Database Purge relay to central cloud */
     if (strcmp(url, "/api/database/purge") == 0) {
         const char* post_body = (header_size > 0) ? (req_buf + header_size) : "{}";
+        char purged_ts[64] = {0};
+        get_utc_iso_timestamp(purged_ts, sizeof(purged_ts));
+        int next_seq = (int)g_last_known_sequence + 1;
+
         char* cloud_resp = (char*)malloc(CLOUD_RESPONSE_MAX);
         if (cloud_resp && relay_to_central_cloud("POST", "/api/database/purge", post_body, body_received, cloud_resp, CLOUD_RESPONSE_MAX)) {
+            char remote_ts[64] = {0};
+            if (extract_json_string_field(cloud_resp, "\"last_purged_at\"", remote_ts, sizeof(remote_ts)) ||
+                extract_json_string_field(cloud_resp, "\"timestamp\"", remote_ts, sizeof(remote_ts))) {
+                snprintf(purged_ts, sizeof(purged_ts), "%s", remote_ts);
+            }
+            next_seq = extract_sequence_from_json(cloud_resp, next_seq);
+            update_local_purge_marker_and_cache(purged_ts, next_seq);
+            broadcast_sse_purge(purged_ts, "DATABASE_PURGED", 1);
             send_json_response(client, cloud_resp);
             free(cloud_resp);
             free(req_buf);
             return;
         }
         if (cloud_resp) free(cloud_resp);
+        update_local_purge_marker_and_cache(purged_ts, next_seq);
+        broadcast_sse_purge(purged_ts, "DATABASE_PURGED", 1);
         free(req_buf);
-        send_json_response(client, "{\"success\":true,\"message\":\"پایگاه داده محلی پاک‌سازی شد\",\"timestamp\":\"\"}\n");
+        char local_purge_resp[384];
+        snprintf(local_purge_resp, sizeof(local_purge_resp),
+            "{\"success\":true,\"message\":\"پایگاه داده محلی پاک‌سازی شد\",\"last_purged_at\":\"%s\",\"timestamp\":\"%s\",\"server_sequence\":%ld}\n",
+            purged_ts, purged_ts, (long)g_last_known_sequence);
+        send_json_response(client, local_purge_resp);
         return;
     }
 
     /* 3d3. Zero-All Inventory relay */
     if (strcmp(url, "/api/inventory/zero-all") == 0) {
         const char* post_body = (header_size > 0) ? (req_buf + header_size) : "{}";
+        char purged_ts[64] = {0};
+        get_utc_iso_timestamp(purged_ts, sizeof(purged_ts));
+        int next_seq = (int)g_last_known_sequence + 1;
+
         char* cloud_resp = (char*)malloc(CLOUD_RESPONSE_MAX);
         if (cloud_resp) {
-            relay_to_central_cloud("POST", "/api/inventory/zero-all", post_body, body_received, cloud_resp, CLOUD_RESPONSE_MAX);
+            if (relay_to_central_cloud("POST", "/api/inventory/zero-all", post_body, body_received, cloud_resp, CLOUD_RESPONSE_MAX)) {
+                char remote_ts[64] = {0};
+                if (extract_json_string_field(cloud_resp, "\"last_purged_at\"", remote_ts, sizeof(remote_ts)) ||
+                    extract_json_string_field(cloud_resp, "\"timestamp\"", remote_ts, sizeof(remote_ts))) {
+                    snprintf(purged_ts, sizeof(purged_ts), "%s", remote_ts);
+                }
+                next_seq = extract_sequence_from_json(cloud_resp, next_seq);
+            }
             free(cloud_resp);
         }
 
-        EnterCriticalSection(&g_sse_cs);
-        if (g_sse_client_count > 0) {
-            const char* broadcast_frame = "data: {\"type\":\"INVENTORY_ZEROED\",\"timestamp\":\"\"}\n\n";
-            int frame_len = (int)strlen(broadcast_frame);
-            for (int i = 0; i < g_sse_client_count; i++) {
-                if (g_sse_clients[i] != INVALID_SOCKET) {
-                    send(g_sse_clients[i], broadcast_frame, frame_len, 0);
-                }
-            }
-        }
-        LeaveCriticalSection(&g_sse_cs);
+        update_local_purge_marker_and_cache(purged_ts, next_seq);
+        broadcast_sse_purge(purged_ts, "DATABASE_PURGED", 1);
 
         free(req_buf);
-        send_json_response(client, "{\"success\":true,\"message\":\"کلیه موجودی‌های انبار در سرور محلی و ابری با موفقیت صفر شدند.\",\"timestamp\":\"\"}\n");
+        char resp[384];
+        snprintf(resp, sizeof(resp),
+            "{\"success\":true,\"message\":\"کلیه موجودی‌های انبار در سرور محلی و ابری با موفقیت صفر شدند.\",\"last_purged_at\":\"%s\",\"timestamp\":\"%s\",\"server_sequence\":%ld}\n",
+            purged_ts, purged_ts, (long)g_last_known_sequence);
+        send_json_response(client, resp);
         return;
     }
 
     /* 3d4. Purge-All Except Products relay */
     if (strcmp(url, "/api/database/purge-all-except-products") == 0 || strcmp(url, "/api/database/manager-purge") == 0) {
         const char* post_body = (header_size > 0) ? (req_buf + header_size) : "{}";
+        char purged_ts[64] = {0};
+        get_utc_iso_timestamp(purged_ts, sizeof(purged_ts));
+        int next_seq = (int)g_last_known_sequence + 1;
+
         char* cloud_resp = (char*)malloc(CLOUD_RESPONSE_MAX);
         if (cloud_resp) {
-            relay_to_central_cloud("POST", "/api/database/purge-all-except-products", post_body, body_received, cloud_resp, CLOUD_RESPONSE_MAX);
+            if (relay_to_central_cloud("POST", "/api/database/purge-all-except-products", post_body, body_received, cloud_resp, CLOUD_RESPONSE_MAX)) {
+                char remote_ts[64] = {0};
+                if (extract_json_string_field(cloud_resp, "\"last_purged_at\"", remote_ts, sizeof(remote_ts)) ||
+                    extract_json_string_field(cloud_resp, "\"timestamp\"", remote_ts, sizeof(remote_ts))) {
+                    snprintf(purged_ts, sizeof(purged_ts), "%s", remote_ts);
+                }
+                next_seq = extract_sequence_from_json(cloud_resp, next_seq);
+            }
             free(cloud_resp);
         }
 
-        EnterCriticalSection(&g_sse_cs);
-        if (g_sse_client_count > 0) {
-            const char* broadcast_frame = "data: {\"type\":\"DATABASE_PURGED\",\"preserve_products\":true,\"timestamp\":\"\"}\n\n";
-            int frame_len = (int)strlen(broadcast_frame);
-            for (int i = 0; i < g_sse_client_count; i++) {
-                if (g_sse_clients[i] != INVALID_SOCKET) {
-                    send(g_sse_clients[i], broadcast_frame, frame_len, 0);
-                }
-            }
-        }
-        LeaveCriticalSection(&g_sse_cs);
+        update_local_purge_marker_and_cache(purged_ts, next_seq);
+        broadcast_sse_purge(purged_ts, "DATABASE_PURGED", 1);
 
         free(req_buf);
-        send_json_response(client, "{\"success\":true,\"message\":\"کلیه داده‌های پایگاه داده و گزارش‌ها با موفقیت پاک‌سازی شدند (نام کالاها حفظ گردید).\",\"timestamp\":\"\"}\n");
+        char resp[384];
+        snprintf(resp, sizeof(resp),
+            "{\"success\":true,\"message\":\"کلیه داده‌های پایگاه داده و گزارش‌ها با موفقیت پاک‌سازی شدند (نام کالاها حفظ گردید).\",\"last_purged_at\":\"%s\",\"timestamp\":\"%s\",\"server_sequence\":%ld}\n",
+            purged_ts, purged_ts, (long)g_last_known_sequence);
+        send_json_response(client, resp);
         return;
     }
 

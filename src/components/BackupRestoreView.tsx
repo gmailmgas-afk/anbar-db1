@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { RuntimeEnvironment, User } from '../types';
 import { LocalStorageManager, LocalDatabaseState } from '../database/storage';
+import { SyncEngine } from '../sync-engine/sync-client';
 import {
   HardDriveDownload,
   HardDriveUpload,
@@ -171,24 +172,22 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
         return;
       }
 
-      // 3. Wipe client-side LocalStorage
-      LocalStorageManager.purgeAllDatabaseData(currentEnv, currentUser.full_name || 'مهندس عمویی', purgeAllEnvs);
+      // 3. Wipe client-side LocalStorage + queue pending purge sync
+      const author = currentUser.full_name || 'مهندس عمویی';
+      const purgedAt = new Date().toISOString();
+      LocalStorageManager.purgeAllDatabaseData(currentEnv, author, purgeAllEnvs, inputPwdHash, inputAnsHash);
 
-      // 4. Notify backend server endpoint with verification hashes
-      try {
-        await fetch('/api/database/purge', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            password_hash: inputPwdHash,
-            answer_hash: inputAnsHash
-          })
-        });
-      } catch {
-        // quiet fallback for offline/standalone mode
-      }
+      // 4. Notify backend server + Cloudflare D1 worker authoritatively
+      await SyncEngine.executeRemotePurge(currentEnv, {
+        mode: 'FULL_PURGE',
+        author,
+        password_hash: inputPwdHash,
+        answer_hash: inputAnsHash,
+        purgedAt
+      });
+      await SyncEngine.syncNow(currentEnv);
 
-      setPurgeSuccess('پایگاه‌داده با موفقیت و پس از تایید هویت دومرحله‌ای محرمانه، کاملاً پاک‌سازی و تخلیه گردید.');
+      setPurgeSuccess('پایگاه‌داده با موفقیت و پس از تایید هویت دومرحله‌ای محرمانه، در تمامی دستگاه‌ها کاملاً پاک‌سازی و تخلیه گردید.');
       setPurgePassword('');
       setSecurityAnswer('');
       setShowPurgeModal(false);

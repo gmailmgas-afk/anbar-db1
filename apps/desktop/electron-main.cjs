@@ -186,6 +186,16 @@ ipcMain.handle('sqlite:record-event', async (event, syncEvent) => {
   return sqliteManager.recordLocalEvent(syncEvent);
 });
 
+ipcMain.handle('sqlite:purge', async (_event, options = {}) => {
+  const result = sqliteManager.purgeLocalDatabase(options);
+  BrowserWindow.getAllWindows().forEach(win => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('sqlite:updated', { entity_type: 'SYSTEM', action: 'DATABASE_PURGED', ...options });
+    }
+  });
+  return result;
+});
+
 ipcMain.handle('sqlite:backup', async (event, options = {}) => {
   const rootDir = sqliteManager.getAppRootDirectory(app);
   const defaultFileName = `mgas_${isWarehouse ? 'warehouse' : 'office'}_backup_${Date.now()}.db`;

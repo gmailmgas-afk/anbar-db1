@@ -277,6 +277,8 @@ interface ServerUser {
   password_hash?: string;
   password_salt?: string;
   is_password_changed?: boolean;
+  password_updated_at?: string;
+  updated_at?: string;
   full_name: string;
   role: 'ADMIN' | 'WAREHOUSE_KEEPER' | 'GENERAL_MANAGER' | 'INTERNAL_MANAGER';
   role_title?: string;
@@ -397,6 +399,48 @@ function normalizeServerPersianText(str: string): string {
     .toLowerCase();
 }
 
+const LEGACY_AMOUEI_SEED_HASH = '866ab120f94c788b13b98383b7cd799eb7d90abce6ccf84902672dd15fef10cc';
+const LEGACY_KARAMI_SEED_HASH = '5d0e1bf5fcde3e15776e55dc299d0c969fd4cd6c219faa5ec1ff03df36d4f74c';
+
+function applyServerUserSyncPayload(uPayload: any, eventType: string = 'UPDATE') {
+  if (!uPayload) return;
+  const uId = uPayload?.user_id;
+  const uname = uPayload?.username ? String(uPayload.username).toLowerCase().trim() : undefined;
+  const uIndex = serverUsersStore.findIndex(
+    u => (uId && u.user_id === uId) || (uname && u.username.toLowerCase() === uname)
+  );
+  if (eventType === 'DELETE') {
+    if (uIndex >= 0 && serverUsersStore[uIndex].user_id !== 'USR-001') {
+      serverUsersStore.splice(uIndex, 1);
+      persistServerUsers();
+    }
+    return;
+  }
+  if (uIndex >= 0) {
+    const existing = serverUsersStore[uIndex];
+    const existingTime = existing.password_updated_at || existing.updated_at ? new Date(existing.password_updated_at || existing.updated_at!).getTime() : 0;
+    const incomingTime = uPayload.password_updated_at || uPayload.updated_at ? new Date(uPayload.password_updated_at || uPayload.updated_at).getTime() : 0;
+    // Never overwrite a newer password change with an older stale sync event
+    if (existingTime > 0 && incomingTime > 0 && incomingTime < existingTime) {
+      return;
+    }
+    serverUsersStore[uIndex] = {
+      ...existing,
+      ...uPayload,
+      username: uname || existing.username,
+      password_hash: uPayload.password_hash || existing.password_hash,
+      password_salt: uPayload.password_salt || existing.password_salt
+    };
+    persistServerUsers();
+  } else if (uPayload.user_id && uname) {
+    serverUsersStore.push({
+      ...uPayload,
+      username: uname
+    });
+    persistServerUsers();
+  }
+}
+
 function verifyServerPassword(inputPassword: string, user: ServerUser): boolean {
   const trimmed = String(inputPassword || '').trim();
   if (!trimmed) return false;
@@ -407,30 +451,34 @@ function verifyServerPassword(inputPassword: string, user: ServerUser): boolean 
     passwordsToTry.push(enDigits);
   }
 
-  // 1. Verify PBKDF2 hash if present
+  // 1. Verify PBKDF2-SHA512 hash strictly
   if (user.password_hash && user.password_salt) {
     try {
       const saltBuf = Buffer.from(user.password_salt, 'hex');
       const expectedBuf = Buffer.from(user.password_hash, 'hex');
       for (const p of passwordsToTry) {
         const derived = crypto.pbkdf2Sync(p, saltBuf, 100000, 32, 'sha512');
-        if (crypto.timingSafeEqual(derived, expectedBuf)) {
+        if (derived.length === expectedBuf.length && crypto.timingSafeEqual(derived, expectedBuf)) {
           return true;
         }
       }
     } catch {}
   }
 
-  // 2. Standard fallback passwords for seamless login
-  const commonFallbacks = ['123456', '12345678', 'admin', 'amouei', 'karami', 'hajivand', 'gholizadeh', 'safaei', 'hakimi'];
-  for (const p of passwordsToTry) {
-    const pLower = p.toLowerCase();
-    if (commonFallbacks.includes(pLower)) return true;
-    if (user.username === 'amouei' && (p === 'Amouei#Admin11!' || pLower === 'admin')) return true;
-    if (user.username === 'karami' && (p === 'Karami#Office11!' || pLower === 'karami')) return true;
-    if (user.username === 'hajivand' && (p === 'Hajivand#Win7Gas!' || p === 'Gholizadeh#Win7Gas!')) return true;
-    if (user.username === 'safaei' && (p === '123456' || pLower === 'safaei')) return true;
-    if (user.username === 'hakimi' && (p === '123456' || pLower === 'hakimi')) return true;
+  // 2. Only allow untouched legacy placeholder hashes for amouei/karami before password is ever changed
+  if (!user.password_updated_at) {
+    for (const p of passwordsToTry) {
+      const pLower = p.toLowerCase();
+      if (user.username === 'amouei' && user.password_hash === LEGACY_AMOUEI_SEED_HASH) {
+        if (p === 'Amouei#Admin11!' || p === '123456' || pLower === 'admin') return true;
+      }
+      if (user.username === 'karami' && user.password_hash === LEGACY_KARAMI_SEED_HASH) {
+        if (p === 'Karami#Office11!' || p === '123456' || pLower === 'karami') return true;
+      }
+      if (!user.password_hash && !user.password_salt && !user.is_password_changed) {
+        if (p === '123456') return true;
+      }
+    }
   }
 
   return false;
@@ -442,6 +490,8 @@ app.get('/api/auth/users', (req, res) => {
     success: true,
     users: serverUsersStore,
     total_users: serverUsersStore.length,
+    last_purged_at: lastServerPurgedAt,
+    purge_preserve_products: lastPurgePreserveProducts,
     timestamp: new Date().toISOString()
   });
 });
@@ -510,21 +560,121 @@ app.post(['/api/auth/login', '/api/auth/authenticate'], (req, res) => {
     authenticated_via: 'CLOUDFLARE_D1',
     user: matchedUser,
     all_users: serverUsersStore,
+    last_purged_at: lastServerPurgedAt,
+    purge_preserve_products: lastPurgePreserveProducts,
     authenticated_at: new Date().toISOString()
   });
 });
 
 // 3. Update User Credentials / Password & Broadcast Event
 app.post(['/api/auth/change-password', '/api/auth/user-update'], (req, res) => {
-  const { user_id, username, old_username, full_name, role_title, system_id, system_name, password_hash, password_salt } = req.body || {};
+  const {
+    user_id,
+    username,
+    old_username,
+    full_name,
+    role,
+    role_title,
+    system_id,
+    system_name,
+    password,
+    newPassword,
+    password_hash,
+    password_salt,
+    password_updated_at,
+    updated_at,
+    create_if_missing
+  } = req.body || {};
+
   const targetId = user_id;
-  const idx = serverUsersStore.findIndex(u => 
-    (targetId && u.user_id === targetId) || 
+  const idx = serverUsersStore.findIndex(u =>
+    (targetId && u.user_id === targetId) ||
     (old_username && u.username.toLowerCase() === String(old_username).toLowerCase()) ||
-    (username && u.username.toLowerCase() === String(username).toLowerCase())
+    (!targetId && !old_username && username && u.username.toLowerCase() === String(username).toLowerCase())
   );
 
+  const now = new Date().toISOString();
+  let resolvedHash = password_hash;
+  let resolvedSalt = password_salt;
+  const rawNewPass = typeof newPassword === 'string' && newPassword.trim() ? newPassword.trim() : (typeof password === 'string' && password.trim() ? password.trim() : '');
+  if ((!resolvedHash || !resolvedSalt) && rawNewPass) {
+    const normalizedPass = toServerEnglishDigits(rawNewPass);
+    const saltBuf = crypto.randomBytes(16);
+    resolvedSalt = saltBuf.toString('hex');
+    resolvedHash = crypto.pbkdf2Sync(normalizedPass, saltBuf, 100000, 32, 'sha512').toString('hex');
+  }
+
   if (idx === -1) {
+    if ((create_if_missing || req.path === '/api/auth/user-update') && user_id && username) {
+      const cleanUsername = String(username).trim().toLowerCase();
+      if (serverUsersStore.some(u => u.username.toLowerCase() === cleanUsername)) {
+        return res.status(400).json({ success: false, error: `نام کاربری «${cleanUsername}» قبلاً برای کاربر دیگری در سرور ثبت شده است.` });
+      }
+      const createdUser: ServerUser = {
+        user_id,
+        username: cleanUsername,
+        password_hash: resolvedHash,
+        password_salt: resolvedSalt,
+        is_password_changed: true,
+        password_updated_at: resolvedHash ? (password_updated_at || now) : undefined,
+        updated_at: updated_at || now,
+        full_name: full_name?.trim() || cleanUsername,
+        role: role || 'INTERNAL_MANAGER',
+        role_title: role_title?.trim() || 'کارشناس',
+        allowed_device_id: system_id?.trim() || 'SYS-STATION-NEW',
+        system_id: system_id?.trim() || 'SYS-STATION-NEW',
+        system_name: system_name?.trim() || 'سیستم جدید'
+      };
+      serverUsersStore.push(createdUser);
+      persistServerUsers();
+
+      currentSequence++;
+      const eventId = `EVT-USR-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const syncEv: StoredSyncEvent = {
+        event_id: eventId,
+        user_id: 'USR-001',
+        device_id: 'CENTRAL-SERVER',
+        event_type: 'CREATE',
+        entity_type: 'USER',
+        entity_id: createdUser.user_id,
+        payload: createdUser,
+        client_created_at: now,
+        server_received_at: now,
+        server_sequence: currentSequence,
+        schema_version: 1
+      };
+      eventIdToSeqMap.set(eventId, currentSequence);
+      eventStore.push(syncEv);
+      persistEvents();
+
+      if (sseClients.size > 0) {
+        const livePayload = JSON.stringify({
+          type: 'SYNC_EVENTS',
+          events: [syncEv],
+          server_sequence: currentSequence,
+          timestamp: now
+        });
+        sseClients.forEach(client => {
+          try { client.write(`data: ${livePayload}\n\n`); } catch { sseClients.delete(client); }
+        });
+      }
+
+      relayEventsToCloudflare([syncEv], 'CENTRAL-SERVER').catch(() => {});
+      fetch(`${CLOUDFLARE_WORKER_URL}/api/auth/user-update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(createdUser),
+        signal: AbortSignal.timeout(2500)
+      }).catch(() => {});
+
+      return res.json({
+        success: true,
+        message: 'کاربر جدید با موفقیت در پایگاه داده مرکزی ثبت شد.',
+        updated_user: createdUser,
+        server_sequence: currentSequence,
+        updated_at: now
+      });
+    }
     return res.status(404).json({ success: false, error: 'کاربر مورد نظر در پایگاه داده سرور یافت نشد.' });
   }
 
@@ -541,24 +691,26 @@ app.post(['/api/auth/change-password', '/api/auth/user-update'], (req, res) => {
     newUsername = cleanUsername;
   }
 
-  const updatedUser: ServerUser & { updated_at?: string } = {
+  const updatedUser: ServerUser = {
     ...target,
     username: newUsername,
     full_name: full_name?.trim() || target.full_name,
+    role: role || target.role,
     role_title: role_title?.trim() || target.role_title,
     system_id: system_id?.trim() || target.system_id,
     system_name: system_name?.trim() || target.system_name,
     allowed_device_id: system_id?.trim() || target.allowed_device_id,
     is_password_changed: true,
-    updated_at: new Date().toISOString()
+    updated_at: updated_at || now
   };
 
-  if (password_hash && password_salt) {
-    updatedUser.password_hash = password_hash;
-    updatedUser.password_salt = password_salt;
+  if (resolvedHash && resolvedSalt) {
+    updatedUser.password_hash = resolvedHash;
+    updatedUser.password_salt = resolvedSalt;
+    updatedUser.password_updated_at = password_updated_at || updated_at || now;
   }
 
-  serverUsersStore[idx] = updatedUser as ServerUser;
+  serverUsersStore[idx] = updatedUser;
   persistServerUsers();
 
   // Create an authoritative SyncEvent for USER entity
@@ -572,8 +724,8 @@ app.post(['/api/auth/change-password', '/api/auth/user-update'], (req, res) => {
     entity_type: 'USER',
     entity_id: updatedUser.user_id || targetId,
     payload: updatedUser,
-    client_created_at: new Date().toISOString(),
-    server_received_at: new Date().toISOString(),
+    client_created_at: now,
+    server_received_at: now,
     server_sequence: currentSequence,
     schema_version: 1
   };
@@ -588,27 +740,49 @@ app.post(['/api/auth/change-password', '/api/auth/user-update'], (req, res) => {
       type: 'SYNC_EVENTS',
       events: [syncEv],
       server_sequence: currentSequence,
-      timestamp: new Date().toISOString()
+      timestamp: now
     });
     sseClients.forEach(client => {
       try { client.write(`data: ${livePayload}\n\n`); } catch { sseClients.delete(client); }
     });
   }
 
-  // Relay to Cloudflare D1
+  // Relay both sync event AND direct user-update to Cloudflare D1
   relayEventsToCloudflare([syncEv], 'CENTRAL-SERVER').catch(() => {});
+  fetch(`${CLOUDFLARE_WORKER_URL}/api/auth/change-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      user_id: updatedUser.user_id,
+      username: updatedUser.username,
+      old_username: target.username,
+      full_name: updatedUser.full_name,
+      role: updatedUser.role,
+      role_title: updatedUser.role_title,
+      system_id: updatedUser.system_id,
+      system_name: updatedUser.system_name,
+      password_hash: updatedUser.password_hash,
+      password_salt: updatedUser.password_salt,
+      password_updated_at: updatedUser.password_updated_at,
+      updated_at: updatedUser.updated_at
+    }),
+    signal: AbortSignal.timeout(2500)
+  }).catch(() => {});
 
   res.json({
     success: true,
     message: 'اطلاعات هویتی و کلمه عبور کاربر با موفقیت در پایگاه داده مرکزی به‌روزرسانی شد.',
     updated_user: updatedUser,
     server_sequence: currentSequence,
-    updated_at: new Date().toISOString()
+    updated_at: now
   });
 });
 
 // Purge tracking marker to permanently prevent resurrected historical events
 let lastServerPurgedAt: string | null = null;
+let lastPurgePreserveProducts = true;
+let lastPurgeSequence = 0;
+let lastZeroedAt: string | null = null;
 const PURGE_MARKER_FILE = path.resolve(__dirname, 'data', 'server_purge_marker.json');
 
 try {
@@ -616,12 +790,154 @@ try {
     const raw = fs.readFileSync(PURGE_MARKER_FILE, 'utf-8');
     const parsed = JSON.parse(raw);
     lastServerPurgedAt = parsed.purged_at || null;
+    if (typeof parsed.preserve_products === 'boolean') {
+      lastPurgePreserveProducts = parsed.preserve_products;
+    }
+    if (typeof parsed.purge_sequence === 'number') {
+      lastPurgeSequence = parsed.purge_sequence;
+      currentSequence = Math.max(currentSequence, lastPurgeSequence);
+    }
+    if (parsed.last_zeroed_at) {
+      lastZeroedAt = parsed.last_zeroed_at;
+    }
   }
 } catch {}
 
+// If persisted events loaded earlier contain stale pre-purge non-USER events, strip them on boot
+if (lastServerPurgedAt) {
+  const purgeMs = new Date(lastServerPurgedAt).getTime();
+  if (!isNaN(purgeMs) && purgeMs > 0) {
+    const kept: StoredSyncEvent[] = [];
+    for (const ev of eventStore) {
+      if (ev.entity_type === 'USER' || ev.entity_type === 'SYSTEM') {
+        kept.push(ev);
+        continue;
+      }
+      const evTimeStr = ev.server_received_at || ev.client_created_at;
+      const evMs = evTimeStr ? new Date(evTimeStr).getTime() : 0;
+      if (evMs > purgeMs) {
+        kept.push(ev);
+      }
+    }
+    if (kept.length !== eventStore.length) {
+      eventStore.length = 0;
+      eventIdToSeqMap.clear();
+      for (const ev of kept) {
+        eventStore.push(ev);
+        eventIdToSeqMap.set(ev.event_id, ev.server_sequence);
+      }
+      persistEvents();
+    }
+  }
+}
+
+function savePurgeMarker(author: string, preserveProducts: boolean, purgedAt: string, purgeSeq: number, zeroedAt?: string | null) {
+  try {
+    const dir = path.dirname(PURGE_MARKER_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(PURGE_MARKER_FILE, JSON.stringify({
+      purged_at: purgedAt,
+      preserve_products: preserveProducts,
+      purge_sequence: purgeSeq,
+      last_zeroed_at: zeroedAt || lastZeroedAt || purgedAt,
+      author
+    }), 'utf-8');
+  } catch {}
+}
+
+function applyAuthoritativePurge(opts: {
+  purgedAt: string;
+  preserveProducts: boolean;
+  author: string;
+  zeroOnly?: boolean;
+}) {
+  const { purgedAt, preserveProducts, author, zeroOnly = false } = opts;
+
+  if (zeroOnly) {
+    lastZeroedAt = purgedAt;
+    // Remove only transactional movement/kardex/invoice/notification events or treat full zero+kardex purge consistently
+    const preserved = eventStore.filter(ev =>
+      ev.entity_type === 'USER' ||
+      ev.entity_type === 'PRODUCT' ||
+      ev.entity_type === 'CATEGORY' ||
+      ev.entity_type === 'CUSTOMER' ||
+      ev.entity_type === 'SUPPLIER'
+    );
+    eventStore.length = 0;
+    eventIdToSeqMap.clear();
+    for (const ev of preserved) {
+      eventStore.push(ev);
+      eventIdToSeqMap.set(ev.event_id, ev.server_sequence);
+    }
+  } else {
+    lastServerPurgedAt = purgedAt;
+    lastPurgePreserveProducts = preserveProducts;
+    lastZeroedAt = purgedAt;
+    // Preserve USER events so password updates survive database purge; drop all transactional/notification history
+    const preservedUsers = eventStore.filter(ev => ev.entity_type === 'USER');
+    eventStore.length = 0;
+    eventIdToSeqMap.clear();
+    for (const ev of preservedUsers) {
+      eventStore.push(ev);
+      eventIdToSeqMap.set(ev.event_id, ev.server_sequence);
+    }
+  }
+
+  // Advance sequence monotonically — NEVER reset currentSequence backward to 0!
+  currentSequence = Math.max(currentSequence + 1, 1001);
+  if (!zeroOnly) {
+    lastPurgeSequence = currentSequence;
+  }
+
+  const systemEventId = `EVT-${zeroOnly ? 'ZERO' : 'PURGE'}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const systemEvent: StoredSyncEvent = {
+    event_id: systemEventId,
+    user_id: 'USR-001',
+    device_id: 'CENTRAL-SERVER',
+    event_type: 'DELETE',
+    entity_type: 'SYSTEM',
+    entity_id: zeroOnly ? 'ZERO_ALL_INVENTORY' : (preserveProducts ? 'PURGE_EXCEPT_PRODUCTS' : 'GLOBAL_PURGE'),
+    payload: {
+      action: zeroOnly ? 'INVENTORY_ZEROED' : 'DATABASE_PURGED',
+      purged_at: purgedAt,
+      preserve_products: preserveProducts,
+      author
+    },
+    client_created_at: purgedAt,
+    server_received_at: purgedAt,
+    server_sequence: currentSequence,
+    schema_version: 1
+  };
+  eventIdToSeqMap.set(systemEventId, currentSequence);
+  eventStore.push(systemEvent);
+
+  savePurgeMarker(author, lastPurgePreserveProducts, lastServerPurgedAt || purgedAt, lastPurgeSequence || currentSequence, lastZeroedAt);
+  try {
+    const dir = path.dirname(EVENTS_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(EVENTS_FILE, JSON.stringify(eventStore), 'utf-8');
+  } catch {}
+
+  if (sseClients.size > 0) {
+    const livePayload = JSON.stringify({
+      type: zeroOnly ? 'INVENTORY_ZEROED' : 'DATABASE_PURGED',
+      preserve_products: preserveProducts,
+      timestamp: purgedAt,
+      last_purged_at: lastServerPurgedAt,
+      server_sequence: currentSequence,
+      author
+    });
+    sseClients.forEach(client => {
+      try { client.write(`data: ${livePayload}\n\n`); } catch { sseClients.delete(client); }
+    });
+  }
+
+  return systemEvent;
+}
+
 // Authorized Complete Database Purge Endpoint (Secured with Cryptographic SHA-256 Hashes)
-app.post('/api/database/purge', (req, res) => {
-  const { secret_password, security_answer, password_hash, answer_hash } = req.body || {};
+app.post('/api/database/purge', async (req, res) => {
+  const { secret_password, security_answer, password_hash, answer_hash, author = 'مهندس موسی عمویی' } = req.body || {};
   const sha256 = (str: string) => crypto.createHash('sha256').update(String(str).trim(), 'utf8').digest('hex');
 
   // SHA-256 hash of @Arash2021368
@@ -640,125 +956,89 @@ app.post('/api/database/purge', (req, res) => {
   }
 
   const now = new Date().toISOString();
-  lastServerPurgedAt = now;
+  applyAuthoritativePurge({
+    purgedAt: now,
+    preserveProducts: true,
+    author
+  });
 
+  // Relay synchronously to Cloudflare D1 worker when reachable
   try {
-    const dir = path.dirname(PURGE_MARKER_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(PURGE_MARKER_FILE, JSON.stringify({ purged_at: now }), 'utf-8');
+    await fetch(`${CLOUDFLARE_WORKER_URL}/api/database/purge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password_hash, answer_hash, author, purged_at: now }),
+      signal: AbortSignal.timeout(2500)
+    }).catch(() => {});
   } catch {}
-
-  // Clear in-memory event stores and persisted file
-  eventStore.length = 0;
-  eventIdToSeqMap.clear();
-  currentSequence = 0;
-
-  try {
-    if (fs.existsSync(EVENTS_FILE)) fs.unlinkSync(EVENTS_FILE);
-  } catch {}
-
-  // Broadcast purge event to any active SSE clients
-  if (sseClients.size > 0) {
-    const livePayload = JSON.stringify({
-      type: 'DATABASE_PURGED',
-      timestamp: now
-    });
-    sseClients.forEach(client => {
-      try { client.write(`data: ${livePayload}\n\n`); } catch { sseClients.delete(client); }
-    });
-  }
 
   res.json({
     success: true,
     message: 'پایگاه‌داده سرور با موفقیت کاملاً پاک‌سازی و تخلیه گردید.',
-    timestamp: now
+    timestamp: now,
+    last_purged_at: now,
+    server_sequence: currentSequence
   });
 });
 
 // Zero-All Inventory Endpoint
-app.post('/api/inventory/zero-all', (req, res) => {
-  for (let i = eventStore.length - 1; i >= 0; i--) {
-    if (eventStore[i].entity_type === 'STOCK_MOVEMENT') {
-      eventIdToSeqMap.delete(eventStore[i].event_id);
-      eventStore.splice(i, 1);
-    }
-  }
-  persistEvents();
+app.post('/api/inventory/zero-all', async (req, res) => {
+  const { author = 'مهندس موسی عمویی' } = req.body || {};
+  const now = new Date().toISOString();
+
+  applyAuthoritativePurge({
+    purgedAt: now,
+    preserveProducts: true,
+    author,
+    zeroOnly: false
+  });
 
   // Forward to central Cloudflare D1 worker
   try {
-    fetch(`${CLOUDFLARE_WORKER_URL}/api/inventory/zero-all`, {
+    await fetch(`${CLOUDFLARE_WORKER_URL}/api/inventory/zero-all`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body || {}),
+      body: JSON.stringify({ ...(req.body || {}), purged_at: now }),
       signal: AbortSignal.timeout(2500)
     }).catch(() => {});
   } catch {}
 
-  if (sseClients.size > 0) {
-    const livePayload = JSON.stringify({
-      type: 'INVENTORY_ZEROED',
-      timestamp: new Date().toISOString()
-    });
-    sseClients.forEach(client => {
-      try { client.write(`data: ${livePayload}\n\n`); } catch { sseClients.delete(client); }
-    });
-  }
-
   res.json({
     success: true,
-    message: 'کلیه موجودی‌های انبار در سرور و کلاینت‌ها با موفقیت صفر شدند.',
-    timestamp: new Date().toISOString()
+    message: 'کلیه موجودی‌های انبار، کاردکس و فاکتورها در سرور و کلاینت‌ها با موفقیت صفر شدند.',
+    timestamp: now,
+    last_purged_at: now,
+    server_sequence: currentSequence
   });
 });
 
 // Complete Purge of Database & Reports (Preserving Products Catalog)
-app.post(['/api/database/purge-all-except-products', '/api/database/manager-purge'], (req, res) => {
+app.post(['/api/database/purge-all-except-products', '/api/database/manager-purge'], async (req, res) => {
   const { author = 'مهندس موسی عمویی' } = req.body || {};
   const now = new Date().toISOString();
-  lastServerPurgedAt = now;
 
-  try {
-    const dir = path.dirname(PURGE_MARKER_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(PURGE_MARKER_FILE, JSON.stringify({ purged_at: now, author, preserve_products: true }), 'utf-8');
-  } catch {}
-
-  // Clear in-memory event stores and persisted file
-  eventStore.length = 0;
-  eventIdToSeqMap.clear();
-  currentSequence = 0;
-
-  try {
-    if (fs.existsSync(EVENTS_FILE)) fs.unlinkSync(EVENTS_FILE);
-  } catch {}
+  applyAuthoritativePurge({
+    purgedAt: now,
+    preserveProducts: true,
+    author
+  });
 
   // Forward to central Cloudflare D1 worker
   try {
-    fetch(`${CLOUDFLARE_WORKER_URL}/api/database/purge-all-except-products`, {
+    await fetch(`${CLOUDFLARE_WORKER_URL}/api/database/purge-all-except-products`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body || {}),
+      body: JSON.stringify({ ...(req.body || {}), author, purged_at: now }),
       signal: AbortSignal.timeout(2500)
     }).catch(() => {});
   } catch {}
 
-  if (sseClients.size > 0) {
-    const livePayload = JSON.stringify({
-      type: 'DATABASE_PURGED',
-      preserve_products: true,
-      timestamp: now,
-      author
-    });
-    sseClients.forEach(client => {
-      try { client.write(`data: ${livePayload}\n\n`); } catch { sseClients.delete(client); }
-    });
-  }
-
   res.json({
     success: true,
     message: 'کلیه داده‌های پایگاه‌داده و گزارش‌ها با موفقیت پاک‌سازی شدند (نام کالاها حفظ گردید).',
-    timestamp: now
+    timestamp: now,
+    last_purged_at: now,
+    server_sequence: currentSequence
   });
 });
 
@@ -784,17 +1064,12 @@ async function relayEventsToCloudflare(events: any[], device_id: string) {
   }
 }
 
-// Automatically pull missing events from Cloudflare D1 central database
+// Automatically pull missing events & purge markers from Cloudflare D1 central database
 let isPullingCloudflare = false;
 async function pullEventsFromCloudflare(forcedSinceSeq?: number) {
   if (isPullingCloudflare) return;
   isPullingCloudflare = true;
   try {
-    // If database was purged, do not pull old historical events
-    if (lastServerPurgedAt) {
-      return;
-    }
-
     const seq = forcedSinceSeq !== undefined ? forcedSinceSeq : Math.max(0, currentSequence - 50);
     const resp = await fetch(`${CLOUDFLARE_WORKER_URL}/api/sync?since_sequence=${seq}`, {
       headers: { 'Accept': 'application/json' },
@@ -802,10 +1077,34 @@ async function pullEventsFromCloudflare(forcedSinceSeq?: number) {
     });
     if (!resp.ok) return;
     const data = await resp.json() as any;
+
+    // 1. Check if Cloud D1 recorded a newer database purge
+    if (data && data.last_purged_at) {
+      const cloudPurgeMs = new Date(data.last_purged_at).getTime();
+      const localPurgeMs = lastServerPurgedAt ? new Date(lastServerPurgedAt).getTime() : 0;
+      if (!isNaN(cloudPurgeMs) && cloudPurgeMs > localPurgeMs) {
+        applyAuthoritativePurge({
+          purgedAt: data.last_purged_at,
+          preserveProducts: data.purge_preserve_products !== false,
+          author: 'CLOUDFLARE_D1'
+        });
+      }
+    }
+
+    const activePurgeMs = lastServerPurgedAt ? new Date(lastServerPurgedAt).getTime() : 0;
+
     if (data && Array.isArray(data.events) && data.events.length > 0) {
       const newlyAdded: StoredSyncEvent[] = [];
       for (const ev of data.events) {
         if (!ev || !ev.event_id) continue;
+
+        // Skip historical pre-purge events (except USER records)
+        if (activePurgeMs > 0 && ev.entity_type !== 'USER' && ev.entity_type !== 'SYSTEM') {
+          const evTimeStr = ev.server_received_at || ev.client_created_at;
+          const evMs = evTimeStr ? new Date(evTimeStr).getTime() : 0;
+          if (evMs > 0 && evMs <= activePurgeMs) continue;
+        }
+
         if (!eventIdToSeqMap.has(ev.event_id)) {
           currentSequence = Math.max(currentSequence + 1, ev.server_sequence || (currentSequence + 1));
           eventIdToSeqMap.set(ev.event_id, currentSequence);
@@ -817,6 +1116,12 @@ async function pullEventsFromCloudflare(forcedSinceSeq?: number) {
           };
           eventStore.push(stored);
           newlyAdded.push(stored);
+          if (stored.entity_type === 'USER' && stored.payload) {
+            try {
+              const uPayload = typeof stored.payload === 'string' ? JSON.parse(stored.payload) : stored.payload;
+              applyServerUserSyncPayload(uPayload, stored.event_type);
+            } catch {}
+          }
         }
       }
       if (newlyAdded.length > 0) {
@@ -826,6 +1131,7 @@ async function pullEventsFromCloudflare(forcedSinceSeq?: number) {
             type: 'SYNC_EVENTS',
             events: newlyAdded,
             server_sequence: currentSequence,
+            last_purged_at: lastServerPurgedAt,
             timestamp: new Date().toISOString()
           });
           sseClients.forEach(client => {
@@ -844,8 +1150,8 @@ async function pullEventsFromCloudflare(forcedSinceSeq?: number) {
 // Initial pull on server boot
 setTimeout(() => pullEventsFromCloudflare(0), 1000);
 
-// Background sync every 25 seconds with Cloudflare D1
-setInterval(() => pullEventsFromCloudflare(), 25000);
+// Background sync every 10 seconds with Cloudflare D1
+setInterval(() => pullEventsFromCloudflare(), 10000);
 
 // Real-time Cloud Connection Diagnostic Endpoint
 app.get('/api/sync/status', async (req, res) => {
@@ -912,21 +1218,42 @@ app.get('/api/sync/stream', (req, res) => {
   });
 
   try {
-    res.write(`data: ${JSON.stringify({ type: 'CONNECTED', current_server_sequence: currentSequence })}\n\n`);
-    // Catch up any missing events immediately on connect if requested
+    res.write(`data: ${JSON.stringify({
+      type: 'CONNECTED',
+      current_server_sequence: currentSequence,
+      last_purged_at: lastServerPurgedAt,
+      purge_preserve_products: lastPurgePreserveProducts,
+      purge_sequence: lastPurgeSequence
+    })}\n\n`);
+
     const sinceSeqParam = req.query.since_sequence as string;
-    if (sinceSeqParam !== undefined) {
-      const sinceSeq = parseInt(sinceSeqParam, 10);
-      if (!isNaN(sinceSeq) && sinceSeq < currentSequence) {
-        const missedEvents = eventStore.filter(e => (e.server_sequence || 0) > sinceSeq);
-        if (missedEvents.length > 0) {
-          res.write(`data: ${JSON.stringify({
-            type: 'SYNC_EVENTS',
-            events: missedEvents,
-            server_sequence: currentSequence,
-            timestamp: new Date().toISOString()
-          })}\n\n`);
-        }
+    const sincePurgedAtParam = req.query.since_purged_at as string;
+    const sinceSeq = sinceSeqParam !== undefined ? parseInt(sinceSeqParam, 10) : NaN;
+    const clientPurgeMs = sincePurgedAtParam ? new Date(sincePurgedAtParam).getTime() : 0;
+    const serverPurgeMs = lastServerPurgedAt ? new Date(lastServerPurgedAt).getTime() : 0;
+
+    // Immediately inform reconnecting client if a server purge occurred after its last known purge marker (or if its sequence predates/exceeds server purge)
+    if (serverPurgeMs > 0 && (clientPurgeMs < serverPurgeMs || (!isNaN(sinceSeq) && (sinceSeq < lastPurgeSequence || sinceSeq > currentSequence)))) {
+      res.write(`data: ${JSON.stringify({
+        type: 'DATABASE_PURGED',
+        preserve_products: lastPurgePreserveProducts,
+        timestamp: lastServerPurgedAt,
+        last_purged_at: lastServerPurgedAt,
+        server_sequence: currentSequence
+      })}\n\n`);
+    }
+
+    // Catch up any missing events immediately on connect if requested
+    if (!isNaN(sinceSeq) && sinceSeq < currentSequence) {
+      const missedEvents = eventStore.filter(e => (e.server_sequence || 0) > sinceSeq);
+      if (missedEvents.length > 0) {
+        res.write(`data: ${JSON.stringify({
+          type: 'SYNC_EVENTS',
+          events: missedEvents,
+          server_sequence: currentSequence,
+          last_purged_at: lastServerPurgedAt,
+          timestamp: new Date().toISOString()
+        })}\n\n`);
       }
     }
   } catch (err) {
@@ -964,11 +1291,26 @@ app.post('/api/sync/events', (req, res) => {
       event_id: string;
       server_sequence: number;
       duplicate?: boolean;
+      ignored_pre_purge?: boolean;
     }> = [];
     const newStoredEvents: StoredSyncEvent[] = [];
+    const purgeTimeMs = lastServerPurgedAt ? new Date(lastServerPurgedAt).getTime() : 0;
 
     for (const ev of events) {
       if (!ev || !ev.event_id) continue;
+
+      // Reject stale pre-purge non-USER transactional events so reconnecting offline clients cannot resurrect wiped data
+      if (purgeTimeMs > 0 && ev.entity_type !== 'USER' && ev.entity_type !== 'SYSTEM') {
+        const clientTimeMs = ev.client_created_at ? new Date(ev.client_created_at).getTime() : 0;
+        if (clientTimeMs > 0 && clientTimeMs <= purgeTimeMs) {
+          accepted_events.push({
+            event_id: ev.event_id,
+            server_sequence: currentSequence,
+            ignored_pre_purge: true
+          });
+          continue;
+        }
+      }
 
       if (eventIdToSeqMap.has(ev.event_id)) {
         // Idempotent duplicate
@@ -978,7 +1320,7 @@ app.post('/api/sync/events', (req, res) => {
           duplicate: true
         });
       } else {
-        currentSequence++;
+        currentSequence = Math.max(currentSequence + 1, 1001);
         const seq = currentSequence;
         eventIdToSeqMap.set(ev.event_id, seq);
 
@@ -997,16 +1339,7 @@ app.post('/api/sync/events', (req, res) => {
         if (ev.entity_type === 'USER' && ev.payload) {
           try {
             const uPayload = typeof ev.payload === 'string' ? JSON.parse(ev.payload) : ev.payload;
-            const uId = uPayload?.user_id || ev.entity_id;
-            const uIndex = serverUsersStore.findIndex(u => u.user_id === uId || (uPayload?.username && u.username.toLowerCase() === uPayload.username.toLowerCase()));
-            if (ev.event_type === 'DELETE') {
-              if (uIndex >= 0) serverUsersStore.splice(uIndex, 1);
-            } else if (uIndex >= 0) {
-              serverUsersStore[uIndex] = { ...serverUsersStore[uIndex], ...uPayload };
-            } else if (uPayload) {
-              serverUsersStore.push(uPayload);
-            }
-            persistServerUsers();
+            applyServerUserSyncPayload(uPayload, ev.event_type);
           } catch {}
         }
 
@@ -1024,6 +1357,7 @@ app.post('/api/sync/events', (req, res) => {
         type: 'SYNC_EVENTS',
         events: newStoredEvents,
         server_sequence: currentSequence,
+        last_purged_at: lastServerPurgedAt,
         source_device_id: device_id,
         timestamp: new Date().toISOString()
       });
@@ -1046,6 +1380,7 @@ app.post('/api/sync/events', (req, res) => {
       success: true,
       accepted_events,
       current_server_sequence: currentSequence,
+      last_purged_at: lastServerPurgedAt,
       timestamp: new Date().toISOString()
     });
   } catch (err: any) {
@@ -1055,25 +1390,33 @@ app.post('/api/sync/events', (req, res) => {
 
 app.get('/api/sync', (req, res) => {
   try {
-    // Opportunistically sync from Cloudflare if not purged
-    if (!lastServerPurgedAt) {
-      pullEventsFromCloudflare().catch(() => {});
-    }
+    // Always opportunistically reconcile with Cloudflare D1
+    pullEventsFromCloudflare().catch(() => {});
 
     const sinceSeq = parseInt(String(req.query.since_sequence || '0'), 10);
     const purgeTimeMs = lastServerPurgedAt ? new Date(lastServerPurgedAt).getTime() : 0;
 
+    // If client has a stale sequence higher than currentSequence (legacy reset recovery), treat as full post-purge fetch
+    const effectiveSinceSeq = (!isNaN(sinceSeq) && sinceSeq > currentSequence) ? 0 : (isNaN(sinceSeq) ? 0 : sinceSeq);
+
     const newEvents = eventStore.filter(e => {
-      if (purgeTimeMs > 0 && e.server_received_at && new Date(e.server_received_at).getTime() <= purgeTimeMs) {
-        return false;
+      if (purgeTimeMs > 0 && e.entity_type !== 'USER' && e.entity_type !== 'SYSTEM') {
+        const evTimeStr = e.server_received_at || e.client_created_at;
+        if (evTimeStr && new Date(evTimeStr).getTime() <= purgeTimeMs) {
+          return false;
+        }
       }
-      return e.server_sequence > sinceSeq;
+      return e.server_sequence > effectiveSinceSeq;
     });
 
     res.json({
       success: true,
       events: newEvents,
       server_sequence: currentSequence,
+      last_purged_at: lastServerPurgedAt,
+      purge_preserve_products: lastPurgePreserveProducts,
+      purge_sequence: lastPurgeSequence,
+      last_zeroed_at: lastZeroedAt,
       timestamp: new Date().toISOString()
     });
   } catch (err: any) {

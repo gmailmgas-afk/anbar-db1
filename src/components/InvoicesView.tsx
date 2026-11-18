@@ -178,6 +178,16 @@ export const InvoicesView: React.FC<InvoicesViewProps> = ({
     const state = LocalStorageManager.getState(currentEnv);
     if (!state) return;
 
+    if (
+      state.is_purged &&
+      (!state.goods_receipts || state.goods_receipts.length === 0) &&
+      (!state.stock_movements || state.stock_movements.length === 0) &&
+      (!state.invoices || state.invoices.length === 0)
+    ) {
+      setAllInvoices([]);
+      return;
+    }
+
     let changed = false;
     const currentList: ExtendedInvoice[] = [...((state.invoices as ExtendedInvoice[]) || [])];
 
@@ -325,6 +335,9 @@ export const InvoicesView: React.FC<InvoicesViewProps> = ({
     const handleSyncEvent = () => {
       syncWarehouseEntriesSilently();
     };
+    const handleDatabasePurged = () => {
+      setAllInvoices([]);
+    };
 
     const unsub = LocalStorageManager.subscribe(handleSyncEvent);
     window.addEventListener('mgas:inventory_updated', handleSyncEvent);
@@ -332,6 +345,7 @@ export const InvoicesView: React.FC<InvoicesViewProps> = ({
     window.addEventListener('mgas:stock_movement_created', handleSyncEvent);
     window.addEventListener('mgas:goods_receipt_created', handleSyncEvent);
     window.addEventListener('mgas:db_refreshed', handleSyncEvent);
+    window.addEventListener('mgas:database_purged', handleDatabasePurged);
 
     // Fast background check interval (2.5s) to guarantee instant silent updates
     const timer = setInterval(() => {
@@ -346,6 +360,7 @@ export const InvoicesView: React.FC<InvoicesViewProps> = ({
       window.removeEventListener('mgas:stock_movement_created', handleSyncEvent);
       window.removeEventListener('mgas:goods_receipt_created', handleSyncEvent);
       window.removeEventListener('mgas:db_refreshed', handleSyncEvent);
+      window.removeEventListener('mgas:database_purged', handleDatabasePurged);
     };
   }, [syncWarehouseEntriesSilently]);
 

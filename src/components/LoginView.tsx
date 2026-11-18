@@ -3,7 +3,7 @@ import { User, RuntimeEnvironment } from '../types';
 import { SEED_USERS } from '../database/seed-data';
 import { LocalStorageManager } from '../database/storage';
 import {
-  verifyPassword,
+  verifyUserPasswordStrict,
   sanitizeInput,
   isSafeInput
 } from '../utils/security';
@@ -34,7 +34,7 @@ import { getAuthCookie, saveAuthCookie } from '../utils/cookieAuth';
 import { SyncEngine, getCentralServerUrl, getApiUrl } from '../sync-engine/sync-client';
 
 interface LoginViewProps {
-  onLoginSuccess: (user: User) => void;
+  onLoginSuccess: (user: User, password?: string) => void;
   currentActiveUser?: User | null;
   currentEnv?: RuntimeEnvironment;
   theme?: 'dark' | 'light';
@@ -213,6 +213,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
     let cloudUser: User | null = null;
     let cloudAuthSuccess = false;
+    let serverRejectedResponse: { status: number; error?: string } | null = null;
 
     // STEP A: CLOUD / CENTRAL AUTHORIZATION REQUEST
     try {
@@ -232,28 +233,26 @@ export const LoginView: React.FC<LoginViewProps> = ({
         });
       } catch {}
 
-      // Fallback to local server proxy if direct central failed
-      if (!authRes || !authRes.ok) {
+      // Fallback to local server proxy if direct central was unreachable or had a 5xx server error
+      const localAuthUrl = getApiUrl('/api/auth/login');
+      if ((!authRes || authRes.status >= 500) && localAuthUrl !== `${centralUrl}/api/auth/login`) {
         try {
-          const localAuthUrl = getApiUrl('/api/auth/login');
-          if (localAuthUrl !== `${centralUrl}/api/auth/login`) {
-            authRes = await fetch(localAuthUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                username: trimmedUser,
-                password: trimmedPass,
-                device_id: typeof window !== 'undefined' ? window.location.hostname : 'CLIENT'
-              }),
-              signal: AbortSignal.timeout(3500)
-            });
-          }
+          authRes = await fetch(localAuthUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              username: trimmedUser,
+              password: trimmedPass,
+              device_id: typeof window !== 'undefined' ? window.location.hostname : 'CLIENT'
+            }),
+            signal: AbortSignal.timeout(3500)
+          });
         } catch {}
       }
 
-      if (authRes && authRes.ok) {
+      if (authRes) {
         const authData = await authRes.json().catch(() => ({}));
-        if (authData.success && authData.user) {
+        if (authRes.ok && authData.success && authData.user) {
           cloudUser = authData.user;
           cloudAuthSuccess = true;
 
@@ -263,6 +262,8 @@ export const LoginView: React.FC<LoginViewProps> = ({
           } else {
             LocalStorageManager.saveOrUpdateUser(currentEnv, authData.user, authData.user, false);
           }
+        } else if (authRes.status === 401 || authRes.status === 403 || authRes.status === 404) {
+          serverRejectedResponse = { status: authRes.status, error: authData?.error };
         }
       }
     } catch (netErr) {
@@ -272,15 +273,38 @@ export const LoginView: React.FC<LoginViewProps> = ({
     // اگر مجوز ورود از سرور ابری/مرکزی تایید شد:
     if (cloudAuthSuccess && cloudUser) {
       LocalStorageManager.resetFailedLogin(currentEnv, cloudUser.username);
-      saveAuthCookie(cloudUser.username, trimmedPass);
+      saveAuthCookie(cloudUser.username, trimmedPass, cloudUser.password_hash);
       setIsSubmitting(false);
-      onLoginSuccess(cloudUser);
+      setAuthStatusNotice(null);
+      onLoginSuccess(cloudUser, trimmedPass);
       return;
     }
 
-    // STEP B: LOCAL DATABASE AUTHENTICATION (بررسی پایگاه داده محلی)
-    // چنانچه سرور در دسترس نبود یا هنوز با کلمه عبور جدید محلی همگام نشده بود،
-    // اعتبارسنجی مستقیماً از اطلاعات رمزنگاری‌شده در پایگاه داده محلی انجام می‌شود
+    // بررسی وجود تغییر کاربر همگام‌سازی‌نشده در صف آفلاین همین دستگاه
+    const currentState = LocalStorageManager.getState(currentEnv);
+    const hasPendingLocalUserChange = (currentState.sync_queue || []).some(q => {
+      if (q.status !== 'PENDING' && q.status !== 'UPLOADING') return false;
+      if (q.event?.entity_type !== 'USER') return false;
+      const pUsername = String((q.event?.payload as any)?.username || '').toLowerCase();
+      return pUsername === trimmedUser || String(q.event?.entity_id || '').toLowerCase() === trimmedUser;
+    });
+
+    // اگر سرور مرکزی/محلی به صورت قطعی درخواست را رد کرده و هیچ تغییر آفلاین همگام‌سازی‌نشده‌ای در صف نیست،
+    // هرگز اجازه ورود از روی دیتابیس محلی قدیمی را نده و بلافاصله لیست کاربران را از سرور همگام کن
+    if (serverRejectedResponse && !hasPendingLocalUserChange) {
+      await SyncEngine.fetchAndSyncUsersFromCloud(currentEnv).catch(() => {});
+      const result = LocalStorageManager.recordFailedLogin(currentEnv, trimmedUser);
+      if (result.isLocked) {
+        setErrorMessage('حساب کاربری موقتاً پس از ۵ بار تلاش ناموفق، به مدت ۱۵ دقیقه مسدود گردید.');
+      } else {
+        setErrorMessage(serverRejectedResponse.error || 'نام کاربری یا کلمه عبور وارد شده نامعتبر است.');
+      }
+      setIsSubmitting(false);
+      setAuthStatusNotice(null);
+      return;
+    }
+
+    // STEP B: LOCAL DATABASE AUTHENTICATION (فقط در حالت آفلاین یا وجود تغییر همگام‌سازی‌نشده در صف)
     setAuthStatusNotice('در حال اعتبارسنجی از پایگاه داده محلی...');
 
     try {
@@ -305,7 +329,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
         return (
           uName === trimmedUser ||
           uId === trimmedUser ||
-          fName.includes(normInput) ||
+          (normInput.length > 0 && fName.includes(normInput)) ||
           (u.username === 'amouei' && (normInput === 'عمویی' || normInput === 'admin' || normInput === 'مدیر عامل')) ||
           (u.username === 'karami' && (normInput === 'کرمی' || normInput === 'مدیر داخلی')) ||
           (u.username === 'hajivand' && (normInput === 'حاجی وند' || normInput === 'حاجی‌وند' || normInput === 'انباردار' || normInput === 'gholizadeh' || normInput === 'قلی زاده')) ||
@@ -327,31 +351,8 @@ export const LoginView: React.FC<LoginViewProps> = ({
         return;
       }
 
-      // اعتبارسنجی کلمه عبور با هش PBKDF2 در پایگاه داده محلی (شامل پشتیبانی از کیبورد فارسی و انگلیسی)
-      let isValidLocal = false;
-      if (matchedUser.password_hash && matchedUser.password_salt) {
-        isValidLocal = await verifyPassword(trimmedPass, {
-          algorithm: 'PBKDF2-SHA512',
-          iterations: 100000,
-          salt: matchedUser.password_salt,
-          hash: matchedUser.password_hash
-        });
-      }
-
-      const fallbackPasswords = ['123456', '12345678', 'admin', 'amouei', 'karami', 'hajivand', 'gholizadeh', 'safaei', 'hakimi'];
-      if (!isValidLocal) {
-        const pLower = trimmedPass.toLowerCase();
-        if (
-          fallbackPasswords.includes(pLower) ||
-          (matchedUser.username === 'safaei' && (pLower === '123456' || pLower === 'safaei')) ||
-          (matchedUser.username === 'hakimi' && (pLower === '123456' || pLower === 'hakimi')) ||
-          (matchedUser.username === 'hajivand' && (trimmedPass === 'Hajivand#Win7Gas!' || trimmedPass === 'Gholizadeh#Win7Gas!')) ||
-          (matchedUser.username === 'amouei' && (trimmedPass === 'Amouei#Admin11!' || pLower === 'admin')) ||
-          (matchedUser.username === 'karami' && (trimmedPass === 'Karami#Office11!' || pLower === 'karami'))
-        ) {
-          isValidLocal = true;
-        }
-      }
+      // اعتبارسنجی سخت‌گیرانه کلمه عبور در پایگاه داده محلی (بدون پسوردهای جایگزین قدیمی)
+      const isValidLocal = await verifyUserPasswordStrict(trimmedPass, matchedUser);
 
       if (!isValidLocal) {
         const result = LocalStorageManager.recordFailedLogin(currentEnv, matchedUser.username);
@@ -365,30 +366,16 @@ export const LoginView: React.FC<LoginViewProps> = ({
         return;
       }
 
-      // ورود با موفقیت انجام شد: کلمه عبور محلی صحیح است
+      // ورود آفلاین با موفقیت انجام شد: کلمه عبور محلی صحیح است
       LocalStorageManager.resetFailedLogin(currentEnv, matchedUser.username);
-      saveAuthCookie(matchedUser.username, trimmedPass);
+      saveAuthCookie(matchedUser.username, trimmedPass, matchedUser.password_hash);
 
-      // همگام‌سازی فوری کلمه عبور معتبر با سرور مرکزی تا در ورودهای بعدی سرور نیز بلافاصله آن را بشناسد
-      if (matchedUser.password_hash && matchedUser.password_salt) {
-        const changePassUrl = getApiUrl('/api/auth/change-password');
-        fetch(changePassUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            user_id: matchedUser.user_id,
-            username: matchedUser.username,
-            old_username: matchedUser.username,
-            full_name: matchedUser.full_name,
-            role_title: matchedUser.role_title,
-            system_id: matchedUser.system_id,
-            password_hash: matchedUser.password_hash,
-            password_salt: matchedUser.password_salt
-          })
-        }).catch(() => {});
+      // تنها در صورتی که رویداد همگام‌سازی‌نشده‌ای در صف محلی باشد، آن را ارسال کن
+      if ((currentState.sync_queue || []).some(q => q.status === 'PENDING' || q.status === 'UPLOADING')) {
+        SyncEngine.syncNow(currentEnv).catch(() => {});
       }
 
-      onLoginSuccess(matchedUser);
+      onLoginSuccess(matchedUser, trimmedPass);
     } catch (err: any) {
       setErrorMessage(err?.message || 'خطای غیرمنتظره در احراز هویت');
     } finally {

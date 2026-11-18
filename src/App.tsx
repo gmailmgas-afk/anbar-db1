@@ -5,7 +5,8 @@ import {
   Device,
   MovementType,
   StockMovement,
-  CylinderValveInspection
+  CylinderValveInspection,
+  AppNotification
 } from './types';
 import { LocalStorageManager, LocalDatabaseState } from './database/storage';
 import { SyncEngine } from './sync-engine/sync-client';
@@ -37,10 +38,11 @@ import { UsersManagementView } from './components/UsersManagementView';
 import { ProductSearchSelect } from './components/ProductSearchSelect';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { UiFeedbackHost } from './components/UiFeedbackHost';
+import { NotificationsCenterModal } from './components/NotificationsCenterModal';
 
 import { ArrowLeftRight, X, LayoutDashboard, Flame, Boxes, FileText, Menu, PackageCheck, KeyRound, Zap, Users, Truck, CheckCircle2 } from 'lucide-react';
 import { generateUUID, toPersianDigits, parseDecimalNumber } from './utils/persian';
-import { isSafeInput, sanitizeInput, sanitizeNumber, validateFieldSecurity } from './utils/security';
+import { isSafeInput, sanitizeInput, sanitizeNumber, validateFieldSecurity, verifyUserPasswordStrict } from './utils/security';
 import { getAuthCookie, saveAuthCookie, clearAuthCookie, purgeClientDataCache } from './utils/cookieAuth';
 import { initUserFontSize } from './utils/fontSizeCookie';
 import { isPendingRepairCylinderKardex } from './utils/cylinderInspection';
@@ -64,8 +66,9 @@ export default function App() {
         if (info && info.environment) {
           setCurrentEnv(info.environment);
           if (info.environment === 'WAREHOUSE_WIN7') {
-            const whUser = SEED_USERS.find(u => u.user_id === 'USR-003');
-            if (whUser) setCurrentUser(whUser);
+            const whUsers = LocalStorageManager.getUsers('WAREHOUSE_WIN7');
+            const whUser = whUsers.find(u => u.user_id === 'USR-003') || SEED_USERS.find(u => u.user_id === 'USR-003');
+            if (whUser && !getAuthCookie()) setCurrentUser(whUser);
           }
         }
       }).catch(err => {
@@ -75,17 +78,22 @@ export default function App() {
   }, []);
 
   // Single active user session (strictly one user at any moment)
-  // Strict requirement: Only username and password are saved on the client in a cookie.
+  // Strict requirement: Only username and password/hash are saved on the client in a cookie.
   const [currentUser, setCurrentUser] = useState<User | null>(() => {
     // 1. Strictly retrieve authentication credentials from client cookie
     const cookieAuth = getAuthCookie();
     const currentUsers = LocalStorageManager.getUsers(currentEnv);
-    if (cookieAuth && cookieAuth.username) {
+    if (cookieAuth && cookieAuth.username && (cookieAuth.password || cookieAuth.password_hash)) {
       const match = currentUsers.find(u =>
         u.username.toLowerCase() === cookieAuth.username.toLowerCase() ||
         u.user_id === cookieAuth.username
       );
-      if (match) return match;
+      if (match) {
+        if (cookieAuth.password_hash && match.password_hash && cookieAuth.password_hash !== match.password_hash) {
+          return null;
+        }
+        return match;
+      }
     }
     // Return null when unauthenticated so LoginView form executes
     return null;
@@ -103,6 +111,7 @@ export default function App() {
   const [showWin7Modal, setShowWin7Modal] = useState(false);
   const [showTroubleshootingModal, setShowTroubleshootingModal] = useState(false);
   const [showWin11TroubleshootingModal, setShowWin11TroubleshootingModal] = useState(false);
+  const [showNotificationsModal, setShowNotificationsModal] = useState(false);
 
   // Dark Mode / Light Mode Theme state (in-memory)
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
@@ -190,6 +199,7 @@ export default function App() {
         setShowWin7Modal(false);
         setShowTroubleshootingModal(false);
         setShowWin11TroubleshootingModal(false);
+        setShowNotificationsModal(false);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -252,8 +262,12 @@ export default function App() {
     setLocalDb({
       ...fresh,
       gas_kardex_entries: fresh.gas_kardex_entries ? [...fresh.gas_kardex_entries] : [],
+      gas_production_kardex_entries: fresh.gas_production_kardex_entries ? [...fresh.gas_production_kardex_entries] : [],
       cylinder_valve_inspections: fresh.cylinder_valve_inspections ? [...fresh.cylinder_valve_inspections] : [],
       stock_movements: fresh.stock_movements ? [...fresh.stock_movements] : [],
+      goods_receipts: fresh.goods_receipts ? [...fresh.goods_receipts] : [],
+      invoices: fresh.invoices ? [...fresh.invoices] : [],
+      notifications: fresh.notifications ? [...fresh.notifications] : [],
       products: fresh.products ? [...fresh.products] : [],
       customers: fresh.customers ? [...fresh.customers] : [],
       suppliers: fresh.suppliers ? [...fresh.suppliers] : [],
@@ -306,8 +320,26 @@ export default function App() {
       }, 3500);
     };
 
+    const handleRemoteNotification = (e: any) => {
+      refreshLocalState();
+      const notif: AppNotification | undefined = e?.detail;
+      if (notif && (!currentUser || notif.actor_user_id !== currentUser.user_id)) {
+        const ts = Date.now();
+        setInstantSyncToast({
+          message: `🔔 ${notif.title}: ${notif.message}`,
+          timestamp: ts
+        });
+        setTimeout(() => {
+          setInstantSyncToast(prev => (prev && Date.now() - prev.timestamp >= 4400 ? null : prev));
+        }, 4500);
+      }
+    };
+
     window.addEventListener('mgas:db_refreshed', handleDbRefreshed);
     window.addEventListener('mgas:database_refreshed', handleDbRefreshed);
+    window.addEventListener('mgas:database_purged', handleDbRefreshed);
+    window.addEventListener('mgas:notifications_updated', handleDbRefreshed);
+    window.addEventListener('mgas:remote_notification_received', handleRemoteNotification);
     window.addEventListener('mgas:inspection_updated', handleDbRefreshed);
     window.addEventListener('mgas:inspection_added', handleDbRefreshed);
     window.addEventListener('mgas:kardex_trash_updated', handleDbRefreshed);
@@ -318,18 +350,84 @@ export default function App() {
       unsubscribe();
       window.removeEventListener('mgas:db_refreshed', handleDbRefreshed);
       window.removeEventListener('mgas:database_refreshed', handleDbRefreshed);
+      window.removeEventListener('mgas:database_purged', handleDbRefreshed);
+      window.removeEventListener('mgas:notifications_updated', handleDbRefreshed);
+      window.removeEventListener('mgas:remote_notification_received', handleRemoteNotification);
       window.removeEventListener('mgas:inspection_updated', handleDbRefreshed);
       window.removeEventListener('mgas:inspection_added', handleDbRefreshed);
       window.removeEventListener('mgas:kardex_trash_updated', handleDbRefreshed);
       window.removeEventListener('mgas:inventory_updated', handleDbRefreshed);
       window.removeEventListener('mgas:document_synced_instantly', handleInstantDocumentSync);
     };
-  }, [currentEnv, refreshLocalState]);
+  }, [currentEnv, refreshLocalState, currentUser]);
+
+  // Enforce active session validity whenever user records change (auto-logout if password changed elsewhere)
+  useEffect(() => {
+    if (!currentUser) return;
+    let cancelled = false;
+
+    const validateActiveSession = async () => {
+      const latestUsers = LocalStorageManager.getUsers(currentEnv);
+      const latestUser = latestUsers.find(
+        u => u.user_id === currentUser.user_id || u.username.toLowerCase() === currentUser.username.toLowerCase()
+      );
+      if (!latestUser) {
+        if (!cancelled) {
+          setCurrentUser(null);
+          clearAuthCookie();
+          purgeClientDataCache();
+        }
+        return;
+      }
+
+      const cookieAuth = getAuthCookie();
+      if (cookieAuth && (cookieAuth.username.toLowerCase() === latestUser.username.toLowerCase() || cookieAuth.username === latestUser.user_id)) {
+        if (cookieAuth.password) {
+          const stillValid = await verifyUserPasswordStrict(cookieAuth.password, latestUser);
+          if (!stillValid) {
+            if (!cancelled) {
+              setCurrentUser(null);
+              clearAuthCookie();
+              purgeClientDataCache();
+            }
+            return;
+          }
+        } else if (cookieAuth.password_hash && latestUser.password_hash && cookieAuth.password_hash !== latestUser.password_hash) {
+          if (!cancelled) {
+            setCurrentUser(null);
+            clearAuthCookie();
+            purgeClientDataCache();
+          }
+          return;
+        }
+      }
+
+      if (
+        !cancelled &&
+        (latestUser.password_hash !== currentUser.password_hash ||
+         latestUser.password_updated_at !== currentUser.password_updated_at ||
+         latestUser.username !== currentUser.username ||
+         latestUser.full_name !== currentUser.full_name)
+      ) {
+        setCurrentUser(latestUser);
+      }
+    };
+
+    validateActiveSession();
+    const handleUsersUpdated = () => {
+      validateActiveSession();
+    };
+    window.addEventListener('mgas:users_updated', handleUsersUpdated);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('mgas:users_updated', handleUsersUpdated);
+    };
+  }, [currentEnv, currentUser?.user_id, currentUser?.password_hash, localDb.users]);
 
   const handleLoginSuccess = (user: User, password?: string) => {
     setCurrentUser(user);
-    // Strictly save ONLY username and password in client cookie
-    saveAuthCookie(user.username, password || '123456');
+    // Strictly save username, current password (if provided), and password_hash in client cookie
+    saveAuthCookie(user.username, password || '', user.password_hash);
     if (user.username === 'karami' || user.role === 'INTERNAL_MANAGER') {
       LocalStorageManager.renewKaramiSession();
     }
@@ -649,6 +747,15 @@ export default function App() {
     ? localDb.sync_queue.filter(q => q?.status === 'PENDING').length
     : 0;
 
+  const visibleNotifications = useMemo(() => {
+    return LocalStorageManager.getNotificationsForUser(currentEnv, currentUser);
+  }, [currentEnv, currentUser, localDb.notifications]);
+
+  const unreadNotificationsCount = useMemo(() => {
+    const uid = currentUser?.user_id || '';
+    return visibleNotifications.filter(n => !Array.isArray(n.read_by) || !n.read_by.includes(uid)).length;
+  }, [visibleNotifications, currentUser?.user_id]);
+
   // Single user exclusive login screen
   if (!currentUser) {
     return <LoginView currentEnv={currentEnv} onLoginSuccess={handleLoginSuccess} theme={theme} onToggleTheme={handleToggleTheme} />;
@@ -680,6 +787,8 @@ export default function App() {
         onToggleMobileMenu={() => setIsMobileMenuOpen(prev => !prev)}
         theme={theme}
         onToggleTheme={handleToggleTheme}
+        unreadNotificationsCount={unreadNotificationsCount}
+        onOpenNotifications={() => setShowNotificationsModal(true)}
       />
 
       {/* Instant Document Sync Notification Banner (Bypasses 20s rule) */}
@@ -2153,6 +2262,33 @@ export default function App() {
           </div>
         </div>
       )}
+
+      <NotificationsCenterModal
+        isOpen={showNotificationsModal}
+        onClose={() => setShowNotificationsModal(false)}
+        notifications={visibleNotifications}
+        currentUser={currentUser}
+        onMarkRead={(nid) => {
+          LocalStorageManager.markNotificationRead(currentEnv, nid, currentUser.user_id);
+          refreshLocalState();
+        }}
+        onMarkAllRead={() => {
+          LocalStorageManager.markAllNotificationsRead(currentEnv, currentUser.user_id);
+          refreshLocalState();
+        }}
+        onClearAll={() => {
+          LocalStorageManager.clearAllNotifications(currentEnv, currentUser.user_id);
+          refreshLocalState();
+        }}
+        onNavigate={(tab) => {
+          if (isHajivand && (tab === 'gas_kardex' || tab === 'gas_production_kardex' || tab === 'users_management' || tab === 'invoices')) {
+            setActiveTab('movements');
+          } else {
+            setActiveTab(tab as NavTab);
+          }
+          refreshLocalState();
+        }}
+      />
 
       <UiFeedbackHost />
     </div>

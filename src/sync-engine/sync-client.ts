@@ -181,10 +181,197 @@ export class SyncEngine {
     };
   }
 
+  static applyRemotePurgeAcrossAllEnvs(
+    purgedAt: string,
+    preserveProducts: boolean = true,
+    author: string = 'مدیریت ارشد',
+    serverSequence?: number
+  ): boolean {
+    const environments: RuntimeEnvironment[] = ['WAREHOUSE_WIN7', 'OFFICE_WIN11', 'CLOUD_WEB'];
+    let anyChanged = false;
+    const purgedMs = purgedAt ? new Date(purgedAt).getTime() : Date.now();
+
+    for (const targetEnv of environments) {
+      const state = LocalStorageManager.getState(targetEnv);
+      const localMs = state.purged_at ? new Date(state.purged_at).getTime() : 0;
+      const hasLeftoverData =
+        (state.stock_movements?.length || 0) > 0 ||
+        (state.gas_kardex_entries?.length || 0) > 0 ||
+        (state.gas_production_kardex_entries?.length || 0) > 0 ||
+        (state.goods_receipts?.length || 0) > 0 ||
+        (state.invoices?.length || 0) > 0 ||
+        (state.cylinder_valve_inspections?.length || 0) > 0 ||
+        (state.notifications?.length || 0) > 0;
+
+      if (!state.is_purged || purgedMs > localMs || hasLeftoverData) {
+        LocalStorageManager.applyRemotePurgeToLocalState(
+          targetEnv,
+          purgedAt,
+          preserveProducts,
+          author,
+          serverSequence
+        );
+        anyChanged = true;
+      } else if (serverSequence && serverSequence > (state.sync_state?.last_server_sequence || 0)) {
+        state.sync_state.last_server_sequence = serverSequence;
+        LocalStorageManager.saveState(targetEnv, state);
+      }
+    }
+
+    if (anyChanged) {
+      if (typeof window !== 'undefined' && window.desktopAPI?.isDesktop && window.desktopAPI.purgeLocalDatabase) {
+        window.desktopAPI.purgeLocalDatabase({ preserveProducts, purgedAt }).catch(() => {});
+      }
+      this.clearLogs();
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('mgas:database_refreshed'));
+        window.dispatchEvent(new CustomEvent('mgas:database_purged', { detail: { purged_at: purgedAt, preserve_products: preserveProducts, author } }));
+        window.dispatchEvent(new CustomEvent('mgas:inventory_updated'));
+        window.dispatchEvent(new CustomEvent('mgas:stock_movement_added'));
+        window.dispatchEvent(new CustomEvent('mgas:kardex_updated'));
+        window.dispatchEvent(new CustomEvent('mgas:notifications_updated'));
+        window.dispatchEvent(new CustomEvent('mgas:db_refreshed'));
+      }
+    }
+    return anyChanged;
+  }
+
+  static maybeApplyRemotePurgeMarker(
+    env: RuntimeEnvironment,
+    remoteLastPurgedAt?: string | null,
+    preserveProducts: boolean = true,
+    serverSequence?: number,
+    author: string = 'مدیریت ارشد'
+  ): boolean {
+    if (!remoteLastPurgedAt) return false;
+    const remoteMs = new Date(remoteLastPurgedAt).getTime();
+    if (!remoteMs || Number.isNaN(remoteMs)) return false;
+
+    const localState = LocalStorageManager.getState(env);
+    const localMs = localState.purged_at ? new Date(localState.purged_at).getTime() : 0;
+
+    if (localState.pending_purge_sync) {
+      const pendingMs = new Date(localState.pending_purge_sync.purged_at).getTime();
+      if (remoteMs >= pendingMs) {
+        const allEnvs: RuntimeEnvironment[] = ['WAREHOUSE_WIN7', 'OFFICE_WIN11', 'CLOUD_WEB'];
+        for (const e of allEnvs) {
+          const s = LocalStorageManager.getState(e);
+          if (s.pending_purge_sync) {
+            s.pending_purge_sync = undefined;
+            LocalStorageManager.saveState(e, s);
+          }
+        }
+      }
+    }
+
+    if (remoteMs > localMs || !localState.is_purged) {
+      return this.applyRemotePurgeAcrossAllEnvs(remoteLastPurgedAt, preserveProducts, author, serverSequence);
+    }
+    return false;
+  }
+
+  static async executeRemotePurge(
+    env: RuntimeEnvironment,
+    options: {
+      mode: 'ZERO_ALL' | 'PURGE_EXCEPT_PRODUCTS' | 'FULL_PURGE';
+      author: string;
+      password_hash?: string;
+      answer_hash?: string;
+      purgedAt?: string;
+    }
+  ): Promise<{ success: boolean; last_purged_at?: string; server_sequence?: number }> {
+    const purgedAt = options.purgedAt || new Date().toISOString();
+    const endpoint =
+      options.mode === 'FULL_PURGE'
+        ? '/api/database/purge'
+        : options.mode === 'PURGE_EXCEPT_PRODUCTS'
+        ? '/api/database/purge-all-except-products'
+        : '/api/inventory/zero-all';
+
+    const bodyPayload = JSON.stringify({
+      author: options.author,
+      timestamp: purgedAt,
+      preserve_products: true,
+      password_hash: options.password_hash,
+      answer_hash: options.answer_hash
+    });
+
+    const cloudUrl = `${CLOUDFLARE_WORKER_URL}${endpoint}`;
+    const localUrl = getApiUrl(endpoint);
+    const urls = cloudUrl === localUrl ? [localUrl] : [localUrl, cloudUrl];
+
+    let anySuccess = false;
+    let authoritativePurgedAt = purgedAt;
+    let authoritativeSeq = 0;
+
+    const results = await Promise.allSettled(
+      urls.map(u =>
+        fetch(u, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: bodyPayload,
+          signal: AbortSignal.timeout(5000)
+        }).then(async res => {
+          if (!res.ok) return null;
+          return res.json().catch(() => null);
+        })
+      )
+    );
+
+    for (const r of results) {
+      if (r.status === 'fulfilled' && r.value && r.value.success) {
+        anySuccess = true;
+        const ts = r.value.last_purged_at || r.value.timestamp;
+        if (ts && new Date(ts).getTime() >= new Date(authoritativePurgedAt).getTime()) {
+          authoritativePurgedAt = ts;
+        }
+        const seq = Number(r.value.server_sequence || r.value.current_server_sequence || 0);
+        if (seq > authoritativeSeq) authoritativeSeq = seq;
+      }
+    }
+
+    if (anySuccess) {
+      const environments: RuntimeEnvironment[] = ['WAREHOUSE_WIN7', 'OFFICE_WIN11', 'CLOUD_WEB'];
+      for (const targetEnv of environments) {
+        const s = LocalStorageManager.getState(targetEnv);
+        s.pending_purge_sync = undefined;
+        LocalStorageManager.applyRemotePurgeToLocalState(
+          targetEnv,
+          authoritativePurgedAt,
+          true,
+          options.author,
+          authoritativeSeq || undefined
+        );
+      }
+      if (typeof window !== 'undefined' && window.desktopAPI?.isDesktop && window.desktopAPI.purgeLocalDatabase) {
+        window.desktopAPI.purgeLocalDatabase({ preserveProducts: true, purgedAt: authoritativePurgedAt }).catch(() => {});
+      }
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('mgas:database_refreshed'));
+        window.dispatchEvent(new CustomEvent('mgas:database_purged', { detail: { purged_at: authoritativePurgedAt, preserve_products: true, author: options.author } }));
+        window.dispatchEvent(new CustomEvent('mgas:notifications_updated'));
+      }
+      this.addLog('success', 'پاک‌سازی دیتابیس و صفر کردن گزارش‌ها در سرور مرکزی و تمام دستگاه‌ها تایید شد.', 'REMOTE_PURGE');
+    } else {
+      this.addLog('warn', 'پاک‌سازی محلی انجام شد؛ همگام‌سازی پاک‌سازی با سرور در اولین اتصال انجام می‌شود.', 'REMOTE_PURGE_PENDING');
+    }
+
+    return {
+      success: anySuccess,
+      last_purged_at: authoritativePurgedAt,
+      server_sequence: authoritativeSeq || undefined
+    };
+  }
+
   // Force pull latest updates from anbar.mgas.ir
   static async forcePullFromCloud(env: RuntimeEnvironment): Promise<boolean> {
     this.addLog('info', 'درخواست بروزرسانی فوری دیتابیس‌ها از سرور ابری anbar.mgas.ir...', 'FORCE_SYNC');
-    
+
+    const localState = LocalStorageManager.getState(env);
+    if (localState.pending_purge_sync) {
+      await this.executeRemotePurge(env, localState.pending_purge_sync);
+    }
+
     // 1. Try local server force pull proxy
     try {
       const forceUrl = getApiUrl('/api/sync/force-pull');
@@ -194,6 +381,8 @@ export class SyncEngine {
     // 2. Fetch all events from central Cloudflare D1 (https://anbar.mgas.ir) or local proxy
     let eventsList: any[] = [];
     let serverSeq = 1020;
+    let remotePurgedAt: string | null = null;
+    let remotePreserveProducts = true;
 
     try {
       this.addLog('info', 'دریافت مستقیم رویدادها از https://anbar.mgas.ir/api/sync...', 'FORCE_SYNC');
@@ -203,9 +392,13 @@ export class SyncEngine {
       });
       if (directRes.ok) {
         const directData = await directRes.json();
-        if (directData && Array.isArray(directData.events)) {
-          eventsList = directData.events;
-          serverSeq = directData.server_sequence || 1020;
+        if (directData) {
+          remotePurgedAt = directData.last_purged_at || null;
+          remotePreserveProducts = directData.purge_preserve_products !== false;
+          if (Array.isArray(directData.events)) {
+            eventsList = directData.events;
+            serverSeq = directData.server_sequence || 1020;
+          }
         }
       }
     } catch (err: any) {
@@ -217,49 +410,34 @@ export class SyncEngine {
         });
         if (localPullRes.ok) {
           const lData = await localPullRes.json();
-          if (lData && Array.isArray(lData.events)) {
-            eventsList = lData.events;
-            serverSeq = lData.server_sequence || 1020;
+          if (lData) {
+            remotePurgedAt = lData.last_purged_at || remotePurgedAt;
+            remotePreserveProducts = lData.purge_preserve_products !== false;
+            if (Array.isArray(lData.events)) {
+              eventsList = lData.events;
+              serverSeq = lData.server_sequence || 1020;
+            }
           }
         }
       } catch {}
     }
 
+    if (remotePurgedAt) {
+      this.maybeApplyRemotePurgeMarker(env, remotePurgedAt, remotePreserveProducts, serverSeq);
+    }
+
     if (eventsList.length > 0) {
-      const environments: RuntimeEnvironment[] = ['WAREHOUSE_WIN7', 'OFFICE_WIN11', 'CLOUD_WEB'];
-      for (const targetEnv of environments) {
-        const state = LocalStorageManager.getState(targetEnv);
-        const isPurged = Boolean(state.is_purged);
-        const purgedTime = state.purged_at ? new Date(state.purged_at).getTime() : 0;
-
-        for (const ev of eventsList) {
-          // If database was wiped by management, discard legacy pre-purge events!
-          if (isPurged && purgedTime > 0) {
-            const rawTime = (ev as any).timestamp || ev.client_created_at || (ev as any).server_received_at;
-            const evTime = rawTime ? new Date(rawTime).getTime() : 0;
-            if (evTime <= purgedTime) continue;
-          }
-
-          const alreadyExists = state.sync_events.some((e: any) => e.event_id === ev.event_id);
-          if (!alreadyExists) {
-            LocalStorageManager.applyPayloadToLocalState(state, ev);
-            state.sync_events.push(ev);
-            if (typeof window !== 'undefined' && window.desktopAPI?.isDesktop) {
-              window.desktopAPI.recordLocalEvent(ev).catch(() => {});
-            }
-          }
-        }
-        state.sync_state.last_server_sequence = serverSeq;
-        state.sync_state.last_synced_at = new Date().toISOString();
-        state.sync_state.status = 'ONLINE';
-        LocalStorageManager.saveState(targetEnv, state);
-      }
-
-      this.addLog('success', `بروزرسانی دیتابیس‌ها با سرور مرکزی anbar.mgas.ir با موفقیت انجام شد (${eventsList.length} رویداد پردازش شد).`, 'FORCE_SYNC');
+      const applied = this.applyIncomingEventsToAllEnvs(env, eventsList, serverSeq);
+      this.addLog('success', `بروزرسانی دیتابیس‌ها با سرور مرکزی anbar.mgas.ir با موفقیت انجام شد (${applied} رویداد جدید اعمال شد).`, 'FORCE_SYNC');
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('mgas:database_refreshed'));
         window.dispatchEvent(new CustomEvent('mgas:kardex_updated'));
+        window.dispatchEvent(new CustomEvent('mgas:notifications_updated'));
       }
+      return true;
+    }
+
+    if (remotePurgedAt) {
       return true;
     }
 
@@ -480,18 +658,21 @@ export class SyncEngine {
     let anyKardexUpdated = false;
     let anyStockUpdated = false;
     let anyUsersUpdated = false;
+    let anyNotificationsUpdated = false;
+    let latestRemoteNotification: any = null;
 
     for (const targetEnv of environments) {
       const state = LocalStorageManager.getState(targetEnv);
-      const isPurged = Boolean(state.is_purged);
-      const purgedTime = state.purged_at ? new Date(state.purged_at).getTime() : 0;
       let envChanged = false;
 
       for (const ev of incomingEvents) {
         if (!ev || !ev.event_id) continue;
 
-        // Discard pre-purge events if database was purged
-        if (isPurged && purgedTime > 0) {
+        const isPurged = Boolean(state.is_purged);
+        const purgedTime = state.purged_at ? new Date(state.purged_at).getTime() : 0;
+
+        // Discard pre-purge non-USER/SYSTEM events if database was purged
+        if (isPurged && purgedTime > 0 && ev.entity_type !== 'USER' && ev.entity_type !== 'SYSTEM') {
           const rawTime = (ev as any).timestamp || ev.client_created_at || (ev as any).server_received_at;
           const evTime = rawTime ? new Date(rawTime).getTime() : 0;
           if (evTime > 0 && evTime <= purgedTime) continue;
@@ -513,7 +694,19 @@ export class SyncEngine {
             payload: typeof ev.payload === 'string' ? (() => { try { return JSON.parse(ev.payload); } catch { return ev.payload; } })() : ev.payload
           };
           LocalStorageManager.applyPayloadToLocalState(state, normalizedEv);
-          state.sync_events.push(normalizedEv);
+          if (normalizedEv.entity_type !== 'NOTIFICATION' && normalizedEv.entity_type !== 'SYSTEM') {
+            const generatedNotif = LocalStorageManager.appendNotificationFromEvent(state, normalizedEv);
+            if (generatedNotif && targetEnv === activeEnv) {
+              anyNotificationsUpdated = true;
+              latestRemoteNotification = generatedNotif;
+            }
+          } else if (normalizedEv.entity_type === 'NOTIFICATION' && targetEnv === activeEnv) {
+            anyNotificationsUpdated = true;
+          }
+
+          if (!state.sync_events.some((e: any) => e.event_id === normalizedEv.event_id)) {
+            state.sync_events.push(normalizedEv);
+          }
           envChanged = true;
 
           if (targetEnv === activeEnv) {
@@ -523,10 +716,19 @@ export class SyncEngine {
             }
           }
 
-          if (normalizedEv.entity_type === 'GAS_KARDEX' || normalizedEv.entity_type === 'CYLINDER_VALVE_INSPECTION') {
+          if (
+            normalizedEv.entity_type === 'GAS_KARDEX' ||
+            normalizedEv.entity_type === 'GAS_PRODUCTION_KARDEX' ||
+            normalizedEv.entity_type === 'CYLINDER_VALVE_INSPECTION'
+          ) {
             anyKardexUpdated = true;
           }
-          if (normalizedEv.entity_type === 'STOCK_MOVEMENT' || normalizedEv.entity_type === 'PRODUCT' || normalizedEv.entity_type === 'CYLINDER_VALVE_INSPECTION') {
+          if (
+            normalizedEv.entity_type === 'STOCK_MOVEMENT' ||
+            normalizedEv.entity_type === 'PRODUCT' ||
+            normalizedEv.entity_type === 'CYLINDER_VALVE_INSPECTION' ||
+            normalizedEv.entity_type === 'GOODS_RECEIPT'
+          ) {
             anyStockUpdated = true;
           }
           if (normalizedEv.entity_type === 'USER') {
@@ -561,6 +763,12 @@ export class SyncEngine {
       if (anyUsersUpdated) {
         window.dispatchEvent(new CustomEvent('mgas:users_updated'));
       }
+      if (anyNotificationsUpdated) {
+        window.dispatchEvent(new CustomEvent('mgas:notifications_updated'));
+        if (latestRemoteNotification) {
+          window.dispatchEvent(new CustomEvent('mgas:remote_notification_received', { detail: latestRemoteNotification }));
+        }
+      }
     }
 
     return activeAppliedCount;
@@ -578,6 +786,8 @@ export class SyncEngine {
     const centralUrl = getCentralServerUrl();
     let usersData: any[] = [];
     let sourceUsed = 'LOCAL';
+    let remotePurgedAt: string | null = null;
+    let remotePreserveProducts = true;
 
     // 1. Try Central Cloudflare (https://anbar.mgas.ir)
     try {
@@ -587,6 +797,10 @@ export class SyncEngine {
       });
       if (res.ok) {
         const data = await res.json();
+        if (data && data.last_purged_at) {
+          remotePurgedAt = data.last_purged_at;
+          remotePreserveProducts = data.purge_preserve_products !== false;
+        }
         if (data && data.success && Array.isArray(data.users)) {
           usersData = data.users;
           sourceUsed = 'CLOUDFLARE_D1';
@@ -605,6 +819,10 @@ export class SyncEngine {
           });
           if (res.ok) {
             const data = await res.json();
+            if (data && data.last_purged_at) {
+              remotePurgedAt = data.last_purged_at;
+              remotePreserveProducts = data.purge_preserve_products !== false;
+            }
             if (data && data.success && Array.isArray(data.users)) {
               usersData = data.users;
               sourceUsed = 'SERVER_PROXY';
@@ -614,8 +832,12 @@ export class SyncEngine {
       } catch {}
     }
 
+    if (remotePurgedAt) {
+      this.maybeApplyRemotePurgeMarker(env, remotePurgedAt, remotePreserveProducts);
+    }
+
     if (usersData.length > 0) {
-      const updatedCount = LocalStorageManager.syncUsersFromCloud(env, usersData);
+      LocalStorageManager.syncUsersFromCloud(env, usersData);
       this.addLog(
         'success',
         `اطلاعات هویتی تمام کاربران (${usersData.length} کاربر) از پایگاه ابری کلودفلر دریافت و در دیتابیس محلی کلاینت ذخیره گردید.`,
@@ -655,12 +877,16 @@ export class SyncEngine {
       });
     }
 
-    // 3. Start lightweight periodic delta sync (every 12s) to maintain harmony with server
+    // 3. Start lightweight periodic delta sync (every 5s) to guarantee instant multi-user notifications & purge propagation
     if (this.liveStreamDeltaTimer) clearInterval(this.liveStreamDeltaTimer);
     this.liveStreamDeltaTimer = setInterval(async () => {
       const state = LocalStorageManager.getState(env);
       if (state.isOfflineSimulated) return;
       try {
+        if (state.pending_purge_sync) {
+          await this.executeRemotePurge(env, state.pending_purge_sync);
+          return;
+        }
         const centralUrl = getCentralServerUrl();
         const sinceSeq = !this.hasCompletedInitialFullPull ? 0 : Math.max(0, (state.sync_state.last_server_sequence || 1000) - 5);
         const res = await fetch(`${centralUrl}/api/sync?since_sequence=${sinceSeq}&device_id=${encodeURIComponent(state.deviceId)}`, {
@@ -669,24 +895,32 @@ export class SyncEngine {
         });
         if (res.ok) {
           const data = await res.json();
-          if (data && data.success && Array.isArray(data.events)) {
-            this.hasCompletedInitialFullPull = true;
-            const applied = this.applyIncomingEventsToAllEnvs(env, data.events, data.server_sequence);
-            if (applied > 0) {
-              this.addLog('success', `دریافت بلادرنگ: ${applied} رویداد جدید از سرور مرکزی اعمال شد.`, 'SSE_RECEIVE');
+          if (data && data.success) {
+            if (data.last_purged_at) {
+              this.maybeApplyRemotePurgeMarker(env, data.last_purged_at, data.purge_preserve_products !== false, data.server_sequence);
+            }
+            if (Array.isArray(data.events)) {
+              this.hasCompletedInitialFullPull = true;
+              const applied = this.applyIncomingEventsToAllEnvs(env, data.events, data.server_sequence);
+              if (applied > 0) {
+                this.addLog('success', `دریافت بلادرنگ: ${applied} رویداد جدید از سرور مرکزی اعمال شد.`, 'SSE_RECEIVE');
+              }
             }
           }
         }
       } catch {}
-    }, 12000);
+    }, 5000);
 
     if (!('EventSource' in window)) return;
     if (this.liveStreamSources[env]) return;
 
     try {
-      const lastSeq = LocalStorageManager.getState(env).sync_state.last_server_sequence || 0;
+      const st = LocalStorageManager.getState(env);
+      const lastSeq = st.sync_state.last_server_sequence || 0;
+      const sincePurgedAt = encodeURIComponent(st.purged_at || '');
       const baseUrl = getApiUrl('/api/sync/stream');
-      const streamUrl = baseUrl.includes('?') ? `${baseUrl}&since_sequence=${lastSeq}` : `${baseUrl}?since_sequence=${lastSeq}`;
+      const sep = baseUrl.includes('?') ? '&' : '?';
+      const streamUrl = `${baseUrl}${sep}since_sequence=${lastSeq}&since_purged_at=${sincePurgedAt}`;
       this.addLog('info', `برقراری ارتباط استریم امن دوطرفه بلادرنگ با سرور (${streamUrl})...`, 'SSE_STREAM');
       const source = new EventSource(streamUrl);
       this.liveStreamSources[env] = source;
@@ -698,6 +932,9 @@ export class SyncEngine {
 
           if (data.type === 'CONNECTED') {
             this.addLog('success', `اتصال امن به کلودفلر برقرار شد. شناسه توالی سرور: ${data.current_server_sequence || 1000}`, 'SSE_CONNECT');
+            if (data.last_purged_at) {
+              this.maybeApplyRemotePurgeMarker(env, data.last_purged_at, data.purge_preserve_products !== false, data.current_server_sequence);
+            }
             // Immediately sync on stream connect so any pending/remote events are reconciled right away
             this.syncNow(env).catch(() => {});
             return;
@@ -705,61 +942,30 @@ export class SyncEngine {
 
           if (data.type === 'DATABASE_PURGED') {
             this.addLog('warn', 'اطلاعیه پاک‌سازی کامل پایگاه‌داده و گزارش‌ها از سرور دریافت گردید.', 'SSE_PURGE');
-            const environments: RuntimeEnvironment[] = ['WAREHOUSE_WIN7', 'OFFICE_WIN11', 'CLOUD_WEB'];
-            const purgeTime = data.timestamp || new Date().toISOString();
-            for (const targetEnv of environments) {
-              const state = LocalStorageManager.getState(targetEnv);
-              state.is_purged = true;
-              state.purged_at = purgeTime;
-              state.is_stock_zeroed_v2 = true;
-              state.stock_zeroed_at = purgeTime;
-              state.stock_movements = [];
-              state.gas_kardex_entries = [];
-              state.gas_production_kardex_entries = [];
-              state.cylinder_valve_inspections = [];
-              state.goods_receipts = [];
-              state.invoices = [];
-              state.sales = [];
-              state.purchases = [];
-              state.sync_queue = [];
-              state.sync_events = [];
-              // Note: state.products is strictly preserved
-              LocalStorageManager.saveState(targetEnv, state);
-            }
-            SyncEngine.clearLogs();
-            if (typeof window !== 'undefined') {
-              window.dispatchEvent(new CustomEvent('mgas:database_refreshed'));
-              window.dispatchEvent(new CustomEvent('mgas:database_purged', { detail: { purged_at: purgeTime } }));
-              window.dispatchEvent(new CustomEvent('mgas:inventory_updated'));
-              window.dispatchEvent(new CustomEvent('mgas:stock_movement_added'));
-              window.dispatchEvent(new CustomEvent('mgas:kardex_updated'));
-            }
+            const purgeTime = data.last_purged_at || data.timestamp || new Date().toISOString();
+            const preserve = data.preserve_products !== false && data.purge_preserve_products !== false;
+            const seq = Number(data.server_sequence || data.current_server_sequence || 0) || undefined;
+            this.applyRemotePurgeAcrossAllEnvs(purgeTime, preserve, data.author || 'مدیریت ارشد', seq);
             return;
           }
 
           if (data.type === 'INVENTORY_ZEROED') {
             this.addLog('info', 'اطلاعیه صفر شدن کلیه موجودی‌های انبار از سرور دریافت شد.', 'SSE_ZERO');
-            const environments: RuntimeEnvironment[] = ['WAREHOUSE_WIN7', 'OFFICE_WIN11', 'CLOUD_WEB'];
-            const zeroTime = data.timestamp || new Date().toISOString();
-            for (const targetEnv of environments) {
-              const state = LocalStorageManager.getState(targetEnv);
-              state.stock_movements = [];
-              state.is_stock_zeroed_v2 = true;
-              state.stock_zeroed_at = zeroTime;
-              LocalStorageManager.saveState(targetEnv, state);
-            }
-            if (typeof window !== 'undefined') {
-              window.dispatchEvent(new CustomEvent('mgas:inventory_updated'));
-              window.dispatchEvent(new CustomEvent('mgas:stock_movement_added'));
-              window.dispatchEvent(new CustomEvent('mgas:database_refreshed'));
-            }
+            const zeroTime = data.last_purged_at || data.timestamp || new Date().toISOString();
+            const seq = Number(data.server_sequence || data.current_server_sequence || 0) || undefined;
+            this.applyRemotePurgeAcrossAllEnvs(zeroTime, true, data.author || 'مدیریت ارشد', seq);
             return;
           }
 
-          if (data.type === 'SYNC_EVENTS' && Array.isArray(data.events)) {
-            const appliedCount = this.applyIncomingEventsToAllEnvs(env, data.events, data.server_sequence);
-            if (appliedCount > 0) {
-              this.addLog('success', `دریافت بلادرنگ: ${appliedCount} رویداد جدید از سرور مرکزی اعمال شد.`, 'SSE_RECEIVE');
+          if (data.type === 'SYNC_EVENTS') {
+            if (data.last_purged_at) {
+              this.maybeApplyRemotePurgeMarker(env, data.last_purged_at, data.purge_preserve_products !== false, data.server_sequence);
+            }
+            if (Array.isArray(data.events)) {
+              const appliedCount = this.applyIncomingEventsToAllEnvs(env, data.events, data.server_sequence);
+              if (appliedCount > 0) {
+                this.addLog('success', `دریافت بلادرنگ: ${appliedCount} رویداد جدید از سرور مرکزی اعمال شد.`, 'SSE_RECEIVE');
+              }
             }
           }
         } catch (e: any) {
@@ -907,9 +1113,14 @@ export class SyncEngine {
     let downloadedCount = 0;
 
     try {
+      // STEP 0: Flush any pending authoritative purge before syncing events
+      if (state.pending_purge_sync) {
+        await this.executeRemotePurge(env, state.pending_purge_sync);
+      }
+
       // STEP A: UPLOAD PENDING EVENTS TO CENTRAL DATABASE
       // Rescue any pending or stranded items across active environment
-      const pendingItems = state.sync_queue.filter(q => q.status === 'PENDING' || q.status === 'UPLOADING');
+      const pendingItems = LocalStorageManager.getState(env).sync_queue.filter(q => q.status === 'PENDING' || q.status === 'UPLOADING');
       if (pendingItems.length > 0) {
         pendingItems.forEach(i => (i.status = 'UPLOADING'));
         LocalStorageManager.saveState(env, state);
@@ -966,6 +1177,14 @@ export class SyncEngine {
           const uploadContentType = uploadRes.headers.get('content-type') || '';
           if (uploadContentType.includes('application/json')) {
             const uploadResult = await uploadRes.json();
+            if (uploadResult.last_purged_at) {
+              this.maybeApplyRemotePurgeMarker(
+                env,
+                uploadResult.last_purged_at,
+                uploadResult.purge_preserve_products !== false,
+                uploadResult.server_sequence
+              );
+            }
             if (uploadResult.success && Array.isArray(uploadResult.accepted_events) && uploadResult.accepted_events.length > 0) {
               const acceptedIds = new Set(
                 uploadResult.accepted_events.map((e: any) => e.event_id)
@@ -1002,14 +1221,14 @@ export class SyncEngine {
           this.addLog('warn', `سرور موقتاً در دسترس نیست: ${uploadErrorMsg || 'عدم دسترسی'} (رویدادها در صف محلی باقی ماندند)`, 'SYNC_OFFLINE');
         }
 
-        LocalStorageManager.saveState(env, state);
+        LocalStorageManager.saveState(env, LocalStorageManager.getState(env));
       }
 
       // STEP B: DOWNLOAD MISSING SERVER EVENTS
-      // On first sync or if local sync_events is empty, pull from sequence 0 to guarantee complete 2-way history
-      const sinceSeq = (!this.hasCompletedInitialFullPull || state.sync_events.length === 0)
+      const currentAfterUpload = LocalStorageManager.getState(env);
+      const sinceSeq = (!this.hasCompletedInitialFullPull || currentAfterUpload.sync_events.length === 0)
         ? 0
-        : Math.max(0, (state.sync_state.last_server_sequence || 0) - 20);
+        : Math.max(0, (currentAfterUpload.sync_state.last_server_sequence || 0) - 20);
       let downloadRes: Response | null = null;
       const centralUrl = getCentralServerUrl();
 
@@ -1038,6 +1257,14 @@ export class SyncEngine {
         const downloadContentType = downloadRes.headers.get('content-type') || '';
         if (downloadContentType.includes('application/json')) {
           const downloadResult = await downloadRes.json();
+          if (downloadResult.last_purged_at) {
+            this.maybeApplyRemotePurgeMarker(
+              env,
+              downloadResult.last_purged_at,
+              downloadResult.purge_preserve_products !== false,
+              downloadResult.server_sequence
+            );
+          }
           if (downloadResult.success && Array.isArray(downloadResult.events)) {
             this.hasCompletedInitialFullPull = true;
             const incomingEvents: SyncEvent[] = downloadResult.events;

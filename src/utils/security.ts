@@ -58,7 +58,8 @@ export function safeCompare(a: string, b: string): boolean {
  * Hash password using PBKDF2 (SHA-512)
  */
 export async function hashPassword(password: string, saltHex?: string, iterations: number = DEFAULT_ITERATIONS): Promise<PasswordHashRecord> {
-  const cleanPass = String(password || '').trim();
+  const rawClean = String(password || '').trim();
+  const cleanPass = saltHex ? rawClean : normalizePasswordDigits(rawClean);
   const salt = saltHex || generateSalt(SALT_BYTES);
 
   if (typeof window !== 'undefined' && window.crypto && window.crypto.subtle) {
@@ -124,7 +125,7 @@ export async function hashPassword(password: string, saltHex?: string, iteration
   }
 }
 
-function normalizePasswordDigits(str: string): string {
+export function normalizePasswordDigits(str: string): string {
   if (!str) return '';
   return String(str)
     .replace(/[\u200E\u200F\u202A-\u202E\u061C]/g, '')
@@ -165,6 +166,58 @@ export async function verifyPassword(inputPassword: string, storedHash: Password
     const computedNorm = await hashPassword(norm, storedHash.salt, storedHash.iterations);
     if (safeCompare(computedNorm.hash, storedHash.hash)) {
       return true;
+    }
+  }
+
+  return false;
+}
+
+// Legacy untouched placeholder hashes in SEED_USERS for amouei & karami ONLY (disabled immediately once password changes)
+const LEGACY_AMOUEI_SEED_HASH = '866ab120f94c788b13b98383b7cd799eb7d90abce6ccf84902672dd15fef10cc';
+const LEGACY_KARAMI_SEED_HASH = '5d0e1bf5fcde3e15776e55dc299d0c969fd4cd6c219faa5ec1ff03df36d4f74c';
+
+/**
+ * Strict User Password Verification:
+ * Always verifies against PBKDF2-SHA512 password_hash + password_salt.
+ * Once a user's password is changed (password_updated_at is set or hash differs from untouched legacy seed),
+ * NO default/previous passwords are accepted under any circumstance.
+ */
+export async function verifyUserPasswordStrict(
+  inputPassword: string,
+  user: {
+    username?: string;
+    password_hash?: string;
+    password_salt?: string;
+    password_updated_at?: string;
+    is_password_changed?: boolean;
+  }
+): Promise<boolean> {
+  const trimmed = String(inputPassword || '').trim();
+  if (!trimmed || !user) return false;
+
+  if (user.password_hash && user.password_salt) {
+    const ok = await verifyPassword(trimmed, {
+      algorithm: 'PBKDF2-SHA512',
+      iterations: 100000,
+      salt: user.password_salt,
+      hash: user.password_hash
+    });
+    if (ok) return true;
+  }
+
+  // Only allow untouched legacy placeholder hashes for amouei/karami before their password has ever been changed
+  if (!user.password_updated_at) {
+    const norm = normalizePasswordDigits(trimmed);
+    const pLower = norm.toLowerCase();
+    if (user.password_hash === LEGACY_AMOUEI_SEED_HASH && user.username === 'amouei') {
+      return norm === 'Amouei#Admin11!' || norm === '123456' || pLower === 'admin';
+    }
+    if (user.password_hash === LEGACY_KARAMI_SEED_HASH && user.username === 'karami') {
+      return norm === 'Karami#Office11!' || norm === '123456' || pLower === 'karami';
+    }
+    // If hash & salt are completely missing on an uninitialized account
+    if (!user.password_hash && !user.password_salt && !user.is_password_changed) {
+      return norm === '123456';
     }
   }
 

@@ -31,7 +31,9 @@ import {
   CylinderTankMapping,
   MovementType,
   ProductionPartRequirement,
-  ProductionPartsAvailabilityResult
+  ProductionPartsAvailabilityResult,
+  AppNotification,
+  NotificationCategory
 } from '../types/index';
 import {
   SEED_PRODUCTS,
@@ -157,9 +159,19 @@ export interface LocalDatabaseState {
   sync_queue: SyncQueueItem[];
   sync_state: SyncState;
   audit_logs: AuditLog[];
+  notifications?: AppNotification[];
   isOfflineSimulated: boolean;
   is_purged?: boolean;
   purged_at?: string;
+  purge_preserve_products?: boolean;
+  pending_purge_sync?: {
+    mode: 'ZERO_ALL' | 'PURGE_EXCEPT_PRODUCTS' | 'FULL_PURGE';
+    purged_at: string;
+    preserve_products: boolean;
+    author: string;
+    password_hash?: string;
+    answer_hash?: string;
+  };
   deleted_entity_ids?: string[];
   is_stock_zeroed_v2?: boolean;
   stock_zeroed_at?: string;
@@ -221,6 +233,7 @@ function getInitialState(env: RuntimeEnvironment): LocalDatabaseState {
       status: 'ONLINE'
     },
     audit_logs: JSON.parse(JSON.stringify(INITIAL_AUDIT_LOGS)),
+    notifications: [],
     users: JSON.parse(JSON.stringify(SEED_USERS)),
     security_policy: {
       strictDomainLock: true,
@@ -377,6 +390,20 @@ export class LocalStorageManager {
     }
   }
 
+  private static async flushIndexedDBNow(env: RuntimeEnvironment, state: LocalDatabaseState): Promise<void> {
+    if (this.persistDebounceTimers[env]) {
+      clearTimeout(this.persistDebounceTimers[env]);
+      delete this.persistDebounceTimers[env];
+    }
+    if (typeof window !== 'undefined') {
+      try {
+        const key = STORAGE_KEYS[env] || `mgas_db_${env}`;
+        window.localStorage.setItem(key, JSON.stringify(state));
+      } catch {}
+    }
+    await this.saveStateToIndexedDB(env, state);
+  }
+
   private static persistStateToClient(env: RuntimeEnvironment, state: LocalDatabaseState) {
     if (typeof window === 'undefined') return;
 
@@ -459,16 +486,38 @@ export class LocalStorageManager {
           return;
         }
 
-        // Never blow away products or user-edited state!
-        // Only merge sync events if IndexedDB had newer pending events
+        // Never resurrect pre-purge state or replay pre-purge events from IndexedDB
+        const currentPurgedMs = current.purged_at ? new Date(current.purged_at).getTime() : 0;
+        const idbPurgedMs = idbState.purged_at ? new Date(idbState.purged_at).getTime() : 0;
+
+        if (idbState.is_purged && idbPurgedMs > currentPurgedMs) {
+          this.applyPurgeInPlace(
+            current,
+            idbState.purged_at!,
+            idbState.purge_preserve_products !== false,
+            'IndexedDB',
+            idbState.sync_state?.last_server_sequence
+          );
+          this.saveState(env, current);
+          return;
+        }
+
+        const effectivePurgedMs = Math.max(currentPurgedMs, idbPurgedMs);
         const existingEventIds = new Set((current.sync_events || []).map(e => e.event_id));
         let hasNewEvents = false;
         for (const ev of idbState.sync_events || []) {
-          if (ev?.event_id && !existingEventIds.has(ev.event_id)) {
-            current.sync_events.push(ev);
-            existingEventIds.add(ev.event_id);
-            hasNewEvents = true;
+          if (!ev?.event_id || existingEventIds.has(ev.event_id)) continue;
+          const evRawTime = (ev as any).timestamp || ev.client_created_at || (ev as any).server_received_at;
+          const evMs = evRawTime ? new Date(evRawTime).getTime() : 0;
+          if (effectivePurgedMs > 0 && evMs > 0 && evMs <= effectivePurgedMs && ev.entity_type !== 'USER' && ev.entity_type !== 'SYSTEM') {
+            continue;
           }
+          this.applyPayloadToLocalState(current, ev);
+          if (!current.sync_events.some(e => e.event_id === ev.event_id)) {
+            current.sync_events.push(ev);
+          }
+          existingEventIds.add(ev.event_id);
+          hasNewEvents = true;
         }
         if (hasNewEvents) {
           this.persistStateToClient(env, current);
@@ -500,8 +549,12 @@ export class LocalStorageManager {
       categories: state.categories ? [...state.categories] : [],
       customers: state.customers ? [...state.customers] : [],
       warehouses: state.warehouses ? [...state.warehouses] : [],
+      goods_receipts: state.goods_receipts ? [...state.goods_receipts] : [],
+      invoices: state.invoices ? [...state.invoices] : [],
       custom_cylinder_item_types: state.custom_cylinder_item_types ? [...state.custom_cylinder_item_types] : [],
       cylinder_tank_mappings: state.cylinder_tank_mappings ? [...state.cylinder_tank_mappings] : [],
+      users: state.users ? [...state.users] : [],
+      notifications: state.notifications ? [...state.notifications] : [],
       sync_queue: state.sync_queue ? [...state.sync_queue] : [],
       audit_logs: state.audit_logs ? [...state.audit_logs] : []
     };
@@ -558,10 +611,122 @@ export class LocalStorageManager {
     this.saveState(env, s);
   }
 
+  private static resetLocalSerialCounters() {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    try {
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < window.localStorage.length; i++) {
+        const k = window.localStorage.key(i);
+        if (k && k.startsWith('mgas_last_serial')) {
+          keysToRemove.push(k);
+        }
+      }
+      keysToRemove.forEach(k => window.localStorage.removeItem(k));
+    } catch {}
+  }
+
+  static applyPurgeInPlace(
+    state: LocalDatabaseState,
+    purgedAt: string,
+    preserveProducts: boolean = true,
+    authorName: string = 'مدیریت ارشد',
+    serverSequence?: number
+  ): boolean {
+    const purgedMs = purgedAt ? new Date(purgedAt).getTime() : Date.now();
+    const existingPurgedMs = state.purged_at ? new Date(state.purged_at).getTime() : 0;
+
+    state.stock_movements = [];
+    state.gas_kardex_entries = [];
+    state.gas_production_kardex_entries = [];
+    state.goods_receipts = [];
+    state.cylinder_valve_inspections = [];
+    state.invoices = [];
+    state.sales = [];
+    state.purchases = [];
+    state.notifications = [];
+
+    if (!preserveProducts) {
+      state.products = [];
+    }
+
+    // Preserve USER identity/password events and strictly post-purge events only
+    state.sync_queue = (state.sync_queue || []).filter(q => {
+      if (!q?.event) return false;
+      if (q.event.entity_type === 'USER') return true;
+      const t = q.created_at ? new Date(q.created_at).getTime() : 0;
+      return t > purgedMs;
+    });
+
+    state.sync_events = (state.sync_events || []).filter(ev => {
+      if (!ev) return false;
+      if (ev.entity_type === 'USER' || ev.entity_type === 'SYSTEM') return true;
+      const rawTime = (ev as any).timestamp || ev.client_created_at || (ev as any).server_received_at;
+      const t = rawTime ? new Date(rawTime).getTime() : 0;
+      return t > purgedMs;
+    });
+
+    state.is_purged = true;
+    state.purged_at = existingPurgedMs > purgedMs ? state.purged_at : purgedAt;
+    state.purge_preserve_products = preserveProducts;
+    state.is_stock_zeroed_v2 = true;
+    state.stock_zeroed_at = state.purged_at;
+
+    // Clear pending purge flag once authoritative server/cloud purge timestamp catches up
+    if (serverSequence && serverSequence > 0 && state.pending_purge_sync) {
+      const pendingMs = new Date(state.pending_purge_sync.purged_at).getTime();
+      if (purgedMs >= pendingMs) {
+        state.pending_purge_sync = undefined;
+      }
+    }
+
+    if (state.sync_state) {
+      state.sync_state.last_synced_at = purgedAt;
+      state.sync_state.pending_events_count = state.sync_queue.filter(q => q.status === 'PENDING').length;
+      if (serverSequence && serverSequence > 0) {
+        state.sync_state.last_server_sequence = Math.max(state.sync_state.last_server_sequence || 0, serverSequence);
+      }
+    }
+
+    state.audit_logs = [
+      {
+        audit_id: `AUDIT-PURGE-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        action: 'DATABASE_PURGED',
+        entity_type: 'SYSTEM',
+        entity_id: 'GLOBAL_PURGE',
+        user_id: 'USR-001',
+        device_id: state.deviceId || 'DEVICE-ADMIN',
+        timestamp: purgedAt,
+        metadata: {
+          author: authorName,
+          preserve_products: preserveProducts,
+          environment: state.environment,
+          wiped_at: purgedAt
+        }
+      }
+    ];
+
+    return true;
+  }
+
+  static applyRemotePurgeToLocalState(
+    env: RuntimeEnvironment,
+    purgedAt: string,
+    preserveProducts: boolean = true,
+    authorName: string = 'مدیریت ارشد',
+    serverSequence?: number
+  ): LocalDatabaseState {
+    const state = this.getState(env);
+    this.applyPurgeInPlace(state, purgedAt, preserveProducts, authorName, serverSequence);
+    this.resetLocalSerialCounters();
+    this.saveState(env, state);
+    this.flushIndexedDBNow(env, this.getState(env)).catch(() => {});
+    return this.getState(env);
+  }
+
   /**
    * Complete Warehouse Stock Zeroing & Reports Purge (Preserving Products Catalog)
    * Clears all stock movements, gas kardex entries, production kardex, receipts, invoices,
-   * inspections, and report transactions across all warehouses, preserving product definitions.
+   * inspections, notifications, and report transactions across all warehouses, preserving product definitions.
    */
   static zeroAllWarehouseStock(env: RuntimeEnvironment, authorName: string = 'مدیریت / انباردار', applyToAllEnvs: boolean = true) {
     const envsToZero: RuntimeEnvironment[] = applyToAllEnvs
@@ -569,56 +734,30 @@ export class LocalStorageManager {
       : [env];
 
     const now = new Date().toISOString();
+    this.resetLocalSerialCounters();
 
     envsToZero.forEach(targetEnv => {
       const state = this.getState(targetEnv);
-      state.stock_movements = [];
-      state.gas_kardex_entries = [];
-      state.gas_production_kardex_entries = [];
-      state.goods_receipts = [];
-      state.cylinder_valve_inspections = [];
-      state.invoices = [];
-      state.sales = [];
-      state.purchases = [];
-      state.sync_queue = [];
-      state.sync_events = [];
-      state.is_stock_zeroed_v2 = true;
-      state.stock_zeroed_at = now;
-      state.is_purged = true;
-      state.purged_at = now;
+      this.applyPurgeInPlace(state, now, true, authorName);
+      state.pending_purge_sync = {
+        mode: 'PURGE_EXCEPT_PRODUCTS',
+        purged_at: now,
+        preserve_products: true,
+        author: authorName
+      };
       this.saveState(targetEnv, state);
+      this.flushIndexedDBNow(targetEnv, this.getState(targetEnv)).catch(() => {});
     });
-
-    try {
-      this.recordLocalChange(
-        env,
-        'USR-001',
-        'STOCK_MOVEMENT',
-        'DELETE',
-        'ZERO_ALL_INVENTORY',
-        { author: authorName, timestamp: now },
-        `پاک‌سازی دیتابیس و صفر کردن کلیه موجودی‌های انبار توسط مدیریت ارشد (${authorName})`
-      );
-    } catch {}
 
     try {
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('mgas:inventory_updated'));
         window.dispatchEvent(new CustomEvent('mgas:stock_movement_added'));
         window.dispatchEvent(new CustomEvent('mgas:database_refreshed'));
-        window.dispatchEvent(new CustomEvent('mgas:database_purged', { detail: { purged_at: now, author: authorName } }));
+        window.dispatchEvent(new CustomEvent('mgas:database_purged', { detail: { purged_at: now, author: authorName, preserve_products: true } }));
         window.dispatchEvent(new CustomEvent('mgas:kardex_updated'));
+        window.dispatchEvent(new CustomEvent('mgas:notifications_updated'));
         window.dispatchEvent(new CustomEvent('mgas:db_refreshed', { detail: { env } }));
-        fetch('/api/inventory/zero-all', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ author: authorName, timestamp: now })
-        }).catch(() => {});
-        fetch('/api/database/purge-all-except-products', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ author: authorName, timestamp: now })
-        }).catch(() => {});
       }
     } catch {}
 
@@ -629,7 +768,7 @@ export class LocalStorageManager {
   /**
    * Complete Database & Reports Purge (Preserving Products Catalog)
    * Wipes all stock movements, gas kardex entries, production kardex, receipts, invoices, inspections,
-   * sales, purchases, audit history and reports across all warehouses and environments,
+   * sales, purchases, notifications, audit history and reports across all warehouses and environments,
    * while keeping product definitions (names, SKUs, categories, units) 100% intact.
    */
   static purgeDatabaseExceptProducts(env: RuntimeEnvironment, authorName: string = 'مهندس موسی عمویی', applyToAllEnvs: boolean = true): LocalDatabaseState {
@@ -714,63 +853,47 @@ export class LocalStorageManager {
    * Wipes all stock movements, kardex entries, invoices, goods receipts, sync queues, and events.
    * Can purge the active environment or all storage environments simultaneously.
    */
-  static purgeAllDatabaseData(env: RuntimeEnvironment, authorName: string = 'مدیریت ارشد', purgeAllEnvs: boolean = true) {
+  static purgeAllDatabaseData(
+    env: RuntimeEnvironment,
+    authorName: string = 'مدیریت ارشد',
+    purgeAllEnvs: boolean = true,
+    passwordHash?: string,
+    answerHash?: string
+  ) {
     const envsToPurge: RuntimeEnvironment[] = purgeAllEnvs
       ? ['OFFICE_WIN11', 'WAREHOUSE_WIN7', 'CLOUD_WEB']
       : [env];
 
     const now = new Date().toISOString();
+    this.resetLocalSerialCounters();
 
     envsToPurge.forEach(targetEnv => {
       const state = this.getState(targetEnv);
-
-      // 1. Mark permanent Purge Tombstone flags
-      state.is_purged = true;
-      state.purged_at = now;
-
-      // 2. Completely clear all transactional and ledger data
-      state.stock_movements = [];
-      state.gas_kardex_entries = [];
-      state.invoices = [];
-      state.goods_receipts = [];
-      state.cylinder_valve_inspections = [];
-      state.sales = [];
-      state.purchases = [];
-      state.sync_queue = [];
-      state.sync_events = [];
-
-      if (state.sync_state) {
-        state.sync_state.last_synced_at = now;
-        state.sync_state.pending_events_count = 0;
-      }
-
-      // 3. Record authorized audit entry
-      const purgeAuditLog: AuditLog = {
-        audit_id: `AUDIT-PURGE-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        action: 'DATABASE_PURGED',
-        entity_type: 'SYSTEM',
-        entity_id: 'GLOBAL_PURGE',
-        user_id: 'ADMIN-ARASH',
-        device_id: state.deviceId || 'DEVICE-ADMIN',
-        timestamp: now,
-        metadata: {
-          author: authorName,
-          reason: 'پاک‌سازی کامل و تخلیه دیتابیس توسط مدیریت با تایید رمز محرمانه شخصی',
-          environment: targetEnv,
-          wiped_at: now
-        }
+      this.applyPurgeInPlace(state, now, true, authorName);
+      state.pending_purge_sync = {
+        mode: 'FULL_PURGE',
+        purged_at: now,
+        preserve_products: true,
+        author: authorName,
+        password_hash: passwordHash,
+        answer_hash: answerHash
       };
-      state.audit_logs = [purgeAuditLog];
-
       this.saveState(targetEnv, state);
+      this.flushIndexedDBNow(targetEnv, this.getState(targetEnv)).catch(() => {});
     });
 
     try {
       if (typeof window !== 'undefined') {
-        window.dispatchEvent(new CustomEvent('mgas:database_purged', { detail: { purged_at: now } }));
+        window.dispatchEvent(new CustomEvent('mgas:inventory_updated'));
+        window.dispatchEvent(new CustomEvent('mgas:stock_movement_added'));
+        window.dispatchEvent(new CustomEvent('mgas:database_refreshed'));
+        window.dispatchEvent(new CustomEvent('mgas:database_purged', { detail: { purged_at: now, author: authorName, preserve_products: true } }));
+        window.dispatchEvent(new CustomEvent('mgas:kardex_updated'));
+        window.dispatchEvent(new CustomEvent('mgas:notifications_updated'));
       }
     } catch {}
 
+    this.notify();
     return true;
   }
 
@@ -2426,6 +2549,11 @@ export class LocalStorageManager {
     // Apply change to local tables
     this.applyPayloadToLocalState(state, syncEvent);
 
+    // Generate persistent cross-device notification if applicable
+    if (entityType !== 'NOTIFICATION' && entityType !== 'SYSTEM') {
+      this.appendNotificationFromEvent(state, syncEvent);
+    }
+
     // Add to local sync_events ledger
     state.sync_events.push(syncEvent);
 
@@ -2464,6 +2592,9 @@ export class LocalStorageManager {
           const exists = otherState.sync_events.some(e => e.event_id === syncEvent.event_id);
           if (!exists) {
             this.applyPayloadToLocalState(otherState, syncEvent);
+            if (entityType !== 'NOTIFICATION' && entityType !== 'SYSTEM') {
+              this.appendNotificationFromEvent(otherState, syncEvent);
+            }
             otherState.sync_events.push(syncEvent);
             this.saveState(targetEnv, otherState);
           }
@@ -2482,10 +2613,254 @@ export class LocalStorageManager {
     try {
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('mgas:local_change_queued', { detail: { env, event: syncEvent } }));
+        window.dispatchEvent(new CustomEvent('mgas:notifications_updated', { detail: { env, event: syncEvent } }));
       }
     } catch {}
 
     return syncEvent;
+  }
+
+  static buildNotificationFromEvent(state: LocalDatabaseState, event: SyncEvent): AppNotification | null {
+    if (!event || !event.event_id) return null;
+    if (event.entity_type === 'NOTIFICATION' || event.entity_type === 'SYSTEM') return null;
+
+    const p: any = event.payload || {};
+    const actorUser = (state.users || SEED_USERS).find(
+      u => u.user_id === event.user_id || u.username === p?.created_by_username || u.username === p?.inspector_name
+    );
+    const actorName =
+      p?.inspector_name ||
+      actorUser?.full_name ||
+      p?.created_by_username ||
+      (event.user_id === 'USR-001' ? 'مهندس موسی عمویی' : event.user_id === 'USR-003' ? 'مهندس حاجی‌وند' : 'کاربر سامانه');
+
+    const createdAt = event.server_received_at || event.client_created_at || new Date().toISOString();
+    const isDelete = event.event_type === 'DELETE';
+    const isUpdate = event.event_type === 'UPDATE';
+
+    let category: NotificationCategory = 'INVENTORY';
+    let targetTab = 'dashboard';
+    let level: AppNotification['level'] = 'info';
+    let title = '';
+    let message = '';
+
+    switch (event.entity_type) {
+      case 'CYLINDER_VALVE_INSPECTION': {
+        category = 'INSPECTION';
+        targetTab = 'cylinder_inspections';
+        const cust = p.customer_name || p.supplier_name || 'طرف حساب';
+        const formNo = p.form_number ? ` (برگه ${p.form_number})` : '';
+        if (isDelete) {
+          level = 'warning';
+          title = 'حذف ورودی بازرسی / شمارش';
+          message = `${actorName} بازرسی ${p.item_name || ''} برای ${cust}${formNo} را حذف کرد.`;
+        } else if (p.status === 'KARDEX_REGISTERED') {
+          level = 'success';
+          targetTab = 'gas_kardex';
+          title = 'ثبت در کاردکس از روی شمارش انبار';
+          message = `${actorName} برگه ${p.form_number || ''} (${cust}) را در کاردکس تعمیر ثبت کرد.`;
+        } else {
+          level = 'info';
+          title = p.source_type === 'SUPPLIER' ? 'ورودی جدید تأمین‌کننده ام‌گاز' : 'ورودی جدید آماده ثبت در کاردکس';
+          message = `${actorName} تعداد ${toPersianDigits(p.actual_healthy_quantity ?? 0)} عدد «${p.item_name || 'شیر/سیلندر'}» برای ${cust}${formNo} شمارش و ثبت کرد.`;
+        }
+        break;
+      }
+      case 'GAS_KARDEX': {
+        category = 'KARDEX_REPAIR';
+        targetTab = 'gas_kardex';
+        const cust = p.customer_name || 'مشتری';
+        const sheet = p.transfer_sheet_number ? ` [برگه ${p.transfer_sheet_number}]` : '';
+        if (isDelete || p.is_deleted) {
+          level = 'warning';
+          title = 'حذف/انتقال ردیف کاردکس تعمیر';
+          message = `${actorName} ردیف کاردکس ${cust} (${p.cylinder_type || ''})${sheet} را حذف کرد.`;
+        } else if (isUpdate) {
+          level = 'info';
+          title = 'ویرایش کاردکس تعمیر سیلندر';
+          message = `${actorName} کاردکس ${cust} (${p.cylinder_type || ''})${sheet} را ویرایش کرد.`;
+        } else {
+          level = 'success';
+          title = 'ثبت ردیف جدید کاردکس تعمیر';
+          message = `${actorName} ردیف جدید برای ${cust} (${p.cylinder_type || 'سیلندر'})${sheet} ثبت کرد.`;
+        }
+        break;
+      }
+      case 'GAS_PRODUCTION_KARDEX': {
+        category = 'KARDEX_PRODUCTION';
+        targetTab = 'gas_production_kardex';
+        const cyl = p.cylinder_type || 'سیلندر تولیدی';
+        const sheet = p.transfer_sheet_number ? ` [برگه ${p.transfer_sheet_number}]` : '';
+        if (isDelete || p.is_deleted) {
+          level = 'warning';
+          title = 'حذف ردیف کاردکس تولید';
+          message = `${actorName} ردیف کاردکس تولید ${cyl}${sheet} را حذف کرد.`;
+        } else {
+          level = isUpdate ? 'info' : 'success';
+          title = isUpdate ? 'بروزرسانی کاردکس تولید' : 'ثبت ردیف کاردکس تولید';
+          message = `${actorName} ردیف کاردکس تولید ${cyl}${sheet} را ثبت/بروزرسانی کرد.`;
+        }
+        break;
+      }
+      case 'STOCK_MOVEMENT': {
+        const movId = p.movement_id || event.entity_id || '';
+        if (movId.startsWith('MOV-INSP-')) return null;
+        category = 'INVENTORY';
+        targetTab = 'movements';
+        const prodName = state.products?.find(pr => pr.product_id === p.product_id)?.name || p.product_id || 'کالا';
+        const isOut = p.movement_type === 'STOCK_OUT' || p.movement_type === 'SALE' || p.movement_type === 'TRANSFER_OUT';
+        level = isDelete ? 'warning' : isOut ? 'warning' : 'success';
+        title = isDelete ? 'حذف سند گردش انبار' : isOut ? 'ثبت خروج کالا از انبار' : 'ثبت ورود کالا به انبار';
+        message = `${actorName}: ${isOut ? 'خروج' : 'ورود'} ${toPersianDigits(p.quantity ?? 0)} عدد «${prodName}» (${p.reference_id || movId})`;
+        break;
+      }
+      case 'GOODS_RECEIPT': {
+        category = 'INVENTORY';
+        targetTab = 'movements';
+        const isExit = p.receipt_type === 'EXIT';
+        level = isDelete ? 'warning' : 'success';
+        title = isDelete ? 'حذف برگه رسمی کالا' : isExit ? 'صدور برگه خروج کالا' : 'صدور برگه ورود کالا';
+        message = `${actorName} برگه شماره ${p.form_number || event.entity_id} برای ${p.party_name || p.customer_name || 'طرف حساب'} را ثبت کرد.`;
+        break;
+      }
+      case 'INVOICE': {
+        category = 'INVOICE';
+        targetTab = 'invoices';
+        level = isDelete ? 'warning' : 'success';
+        title = isDelete ? 'حذف فاکتور' : isUpdate ? 'بروزرسانی فاکتور' : 'صدور فاکتور جدید';
+        message = `${actorName} فاکتور ${p.invoice_number || event.entity_id} (${p.party_name || ''}) را ${isDelete ? 'حذف' : isUpdate ? 'ویرایش' : 'ثبت'} کرد.`;
+        break;
+      }
+      case 'USER': {
+        category = 'USER';
+        targetTab = 'tri_sync';
+        level = 'warning';
+        title = 'تغییر مشخصات یا رمز عبور کاربر';
+        message = `${actorName} مشخصات یا رمز عبور کاربر «${p.full_name || p.username || event.entity_id}» را بروزرسانی کرد.`;
+        break;
+      }
+      case 'PRODUCT': {
+        category = 'INVENTORY';
+        targetTab = 'inventory';
+        level = isDelete ? 'warning' : 'info';
+        title = isDelete ? 'حذف کالا از کاتالوگ' : isUpdate ? 'ویرایش مشخصات کالا' : 'افزودن کالای جدید';
+        message = `${actorName} کالای «${p.name || event.entity_id}» را ${isDelete ? 'حذف' : isUpdate ? 'ویرایش' : 'تعریف'} کرد.`;
+        break;
+      }
+      default:
+        return null;
+    }
+
+    return {
+      notification_id: `NOTIF-${event.event_id}`,
+      title,
+      message,
+      level,
+      category,
+      target_tab: targetTab,
+      actor_user_id: event.user_id,
+      actor_name: actorName,
+      device_id: event.device_id || state.deviceId,
+      entity_type: event.entity_type,
+      entity_id: event.entity_id,
+      read_by: event.user_id ? [event.user_id] : [],
+      created_at: createdAt
+    };
+  }
+
+  static appendNotificationFromEvent(state: LocalDatabaseState, event: SyncEvent): AppNotification | null {
+    const notif = this.buildNotificationFromEvent(state, event);
+    if (!notif) return null;
+    if (!state.notifications) state.notifications = [];
+    const idx = state.notifications.findIndex(n => n.notification_id === notif.notification_id);
+    if (idx === -1) {
+      state.notifications.unshift(notif);
+      if (state.notifications.length > 200) {
+        state.notifications = state.notifications.slice(0, 200);
+      }
+      return notif;
+    }
+    return null;
+  }
+
+  static getNotificationsForUser(env: RuntimeEnvironment, user: User | null): AppNotification[] {
+    const state = this.getState(env);
+    const list = state.notifications || [];
+    if (!user) return [];
+    const isWarehouseKeeper =
+      user.role === 'WAREHOUSE_KEEPER' ||
+      user.username === 'hajivand' ||
+      user.username === 'gholizadeh' ||
+      user.user_id === 'USR-003';
+
+    const filtered = isWarehouseKeeper
+      ? list.filter(n => n.category !== 'KARDEX_REPAIR' && n.category !== 'KARDEX_PRODUCTION' && n.category !== 'INVOICE')
+      : list;
+
+    return [...filtered].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+  }
+
+  static markNotificationRead(env: RuntimeEnvironment, notificationId: string, userId: string) {
+    const state = this.getState(env);
+    if (!state.notifications) return;
+    const target = state.notifications.find(n => n.notification_id === notificationId);
+    if (!target) return;
+    if (!Array.isArray(target.read_by)) target.read_by = [];
+    if (target.read_by.includes(userId)) return;
+
+    target.read_by = [...target.read_by, userId];
+    this.saveState(env, state);
+    this.recordLocalChange(
+      env,
+      userId,
+      'NOTIFICATION',
+      'UPDATE',
+      notificationId,
+      { action: 'MARK_READ', notification_id: notificationId, user_id: userId },
+      'MARK_NOTIFICATION_READ'
+    );
+  }
+
+  static markAllNotificationsRead(env: RuntimeEnvironment, userId: string) {
+    const state = this.getState(env);
+    if (!state.notifications || state.notifications.length === 0) return;
+    const now = new Date().toISOString();
+    let changed = false;
+    state.notifications = state.notifications.map(n => {
+      const readBy = Array.isArray(n.read_by) ? n.read_by : [];
+      if (!readBy.includes(userId)) {
+        changed = true;
+        return { ...n, read_by: [...readBy, userId] };
+      }
+      return n;
+    });
+    if (!changed) return;
+    this.saveState(env, state);
+    this.recordLocalChange(
+      env,
+      userId,
+      'NOTIFICATION',
+      'UPDATE',
+      `ALL-${userId}`,
+      { action: 'MARK_ALL_READ', user_id: userId, timestamp: now },
+      'MARK_ALL_NOTIFICATIONS_READ'
+    );
+  }
+
+  static clearAllNotifications(env: RuntimeEnvironment, userId: string) {
+    const state = this.getState(env);
+    const now = new Date().toISOString();
+    state.notifications = [];
+    this.saveState(env, state);
+    this.recordLocalChange(
+      env,
+      userId,
+      'NOTIFICATION',
+      'DELETE',
+      'CLEAR_ALL',
+      { action: 'CLEAR_ALL', user_id: userId, timestamp: now },
+      'CLEAR_ALL_NOTIFICATIONS'
+    );
   }
 
   // Internal helper to apply entity mutations locally
@@ -2617,16 +2992,28 @@ export class LocalStorageManager {
           (targetUsername && item.username?.toLowerCase() === targetUsername)
         );
         if (event.event_type === 'DELETE') {
-          if (idx >= 0) state.users.splice(idx, 1);
+          if (idx >= 0 && state.users[idx].user_id !== 'USR-001') state.users.splice(idx, 1);
         } else if (idx >= 0) {
+          const existing = state.users[idx];
+          const existingTimeStr = existing.password_updated_at || existing.updated_at;
+          const incomingTimeStr = u?.password_updated_at || u?.updated_at || event.client_created_at;
+          const existingTime = existingTimeStr ? new Date(existingTimeStr).getTime() : 0;
+          const incomingTime = incomingTimeStr ? new Date(incomingTimeStr).getTime() : 0;
+          // Do not overwrite a newer password change with an older stale sync event
+          if (existingTime > 0 && incomingTime > 0 && incomingTime < existingTime) {
+            break;
+          }
           state.users[idx] = {
-            ...state.users[idx],
+            ...existing,
             ...u,
-            password_hash: u?.password_hash || state.users[idx].password_hash,
-            password_salt: u?.password_salt || state.users[idx].password_salt
+            username: targetUsername || existing.username,
+            password_hash: u?.password_hash || existing.password_hash,
+            password_salt: u?.password_salt || existing.password_salt,
+            password_updated_at: u?.password_updated_at || existing.password_updated_at,
+            password: undefined
           };
         } else if (u) {
-          state.users.push(u);
+          state.users.push({ ...u, password: undefined });
         }
         try {
           if (typeof window !== 'undefined') {
@@ -2699,6 +3086,59 @@ export class LocalStorageManager {
           state.gas_production_kardex_entries = state.gas_production_kardex_entries.map(k => k.entry_id === targetId ? { ...k, ...pk, updated_at: new Date().toISOString() } : k);
         } else if (pk) {
           state.gas_production_kardex_entries.push(pk);
+        }
+        break;
+      }
+      case 'NOTIFICATION': {
+        if (!state.notifications) state.notifications = [];
+        const p = payload as any;
+        if (p?.action === 'MARK_READ' && p.notification_id && p.user_id) {
+          state.notifications = state.notifications.map(n =>
+            n.notification_id === p.notification_id
+              ? { ...n, read_by: Array.isArray(n.read_by) && n.read_by.includes(p.user_id) ? n.read_by : [...(n.read_by || []), p.user_id] }
+              : n
+          );
+        } else if (p?.action === 'MARK_ALL_READ' && p.user_id) {
+          const cutoff = p.timestamp ? new Date(p.timestamp).getTime() : Date.now();
+          state.notifications = state.notifications.map(n => {
+            const nt = n.created_at ? new Date(n.created_at).getTime() : 0;
+            if (nt <= cutoff) {
+              const rb = Array.isArray(n.read_by) ? n.read_by : [];
+              return rb.includes(p.user_id) ? n : { ...n, read_by: [...rb, p.user_id] };
+            }
+            return n;
+          });
+        } else if (event.event_type === 'DELETE' || p?.action === 'CLEAR_ALL') {
+          const cutoff = p?.timestamp ? new Date(p.timestamp).getTime() : 0;
+          if (cutoff > 0) {
+            state.notifications = state.notifications.filter(n => new Date(n.created_at || 0).getTime() > cutoff);
+          } else if (p?.notification_id) {
+            state.notifications = state.notifications.filter(n => n.notification_id !== p.notification_id);
+          } else {
+            state.notifications = [];
+          }
+        } else if (p?.notification_id) {
+          const idx = state.notifications.findIndex(n => n.notification_id === p.notification_id);
+          if (idx >= 0) {
+            state.notifications[idx] = { ...state.notifications[idx], ...p };
+          } else {
+            state.notifications.unshift(p as AppNotification);
+          }
+        }
+        break;
+      }
+      case 'SYSTEM': {
+        const p = payload as any;
+        const action = p?.action || '';
+        if (
+          action === 'DATABASE_PURGED' ||
+          action === 'INVENTORY_ZEROED' ||
+          event.entity_id === 'GLOBAL_PURGE' ||
+          event.entity_id === 'ZERO_ALL_INVENTORY'
+        ) {
+          const purgedAt = p?.purged_at || p?.timestamp || event.server_received_at || event.client_created_at || new Date().toISOString();
+          const preserveProducts = p?.preserve_products !== false;
+          this.applyPurgeInPlace(state, purgedAt, preserveProducts, p?.author || 'مدیریت ارشد', event.server_sequence);
         }
         break;
       }
@@ -6990,11 +7430,13 @@ export class LocalStorageManager {
       targetUsername = cleanUsername;
     }
 
+    const now = new Date().toISOString();
     const updatedUser: User = {
       ...target,
       username: targetUsername,
       is_password_changed: true,
-      updated_at: new Date().toISOString(),
+      password_updated_at: (params.password_hash && params.password_salt) ? now : target.password_updated_at,
+      updated_at: now,
       password: undefined // NEVER store plain text
     };
 
@@ -7289,29 +7731,51 @@ export class LocalStorageManager {
         if (existingIdx >= 0) {
           const current = state.users[existingIdx];
 
-          // Preserve local password if changed locally and cloud user does not have a newer hash
+          // Only preserve local password if there is a PENDING local USER change in sync_queue
           let targetHash = cleanUser.password_hash;
           let targetSalt = cleanUser.password_salt;
-          let targetChanged = cleanUser.is_password_changed;
+          let targetChanged = Boolean(cleanUser.is_password_changed);
+          let targetPasswordUpdatedAt = cleanUser.password_updated_at;
 
-          if (current.is_password_changed && current.password_hash && current.password_salt) {
-            const currentTime = current.updated_at ? new Date(current.updated_at).getTime() : 0;
-            const cloudTime = cleanUser.updated_at ? new Date(cleanUser.updated_at).getTime() : 0;
+          const hasPendingLocalUserChange = (state.sync_queue || []).some(
+            q => (q.status === 'PENDING' || q.status === 'UPLOADING') &&
+              q.event?.entity_type === 'USER' &&
+              (q.event?.entity_id === cleanUser.user_id ||
+               (q.event?.payload as any)?.username?.toLowerCase?.() === cleanUser.username)
+          );
+
+          if (hasPendingLocalUserChange && current.password_hash && current.password_salt) {
+            const currentTime = (current.password_updated_at || current.updated_at)
+              ? new Date(current.password_updated_at || current.updated_at!).getTime()
+              : 0;
+            const cloudTime = (cleanUser.password_updated_at || cleanUser.updated_at)
+              ? new Date(cleanUser.password_updated_at || cleanUser.updated_at!).getTime()
+              : 0;
             if (currentTime >= cloudTime || !cleanUser.password_hash) {
               targetHash = current.password_hash;
               targetSalt = current.password_salt;
               targetChanged = true;
+              targetPasswordUpdatedAt = current.password_updated_at;
             }
+          } else if (!cleanUser.password_hash || !cleanUser.password_salt) {
+            targetHash = current.password_hash;
+            targetSalt = current.password_salt;
+            targetChanged = Boolean(current.is_password_changed);
+            targetPasswordUpdatedAt = current.password_updated_at;
           }
 
-          // Check if changed
+          // Check if any field changed
           const isChanged =
+            current.username !== cleanUser.username ||
             current.full_name !== cleanUser.full_name ||
             current.password_hash !== targetHash ||
             current.password_salt !== targetSalt ||
+            Boolean(current.is_password_changed) !== Boolean(targetChanged) ||
+            current.password_updated_at !== targetPasswordUpdatedAt ||
             current.role !== cleanUser.role ||
             current.role_title !== cleanUser.role_title ||
-            current.system_id !== cleanUser.system_id;
+            current.system_id !== cleanUser.system_id ||
+            current.system_name !== cleanUser.system_name;
 
           if (isChanged) {
             state.users[existingIdx] = {
@@ -7319,7 +7783,9 @@ export class LocalStorageManager {
               ...cleanUser,
               password_hash: targetHash,
               password_salt: targetSalt,
-              is_password_changed: targetChanged
+              is_password_changed: targetChanged,
+              password_updated_at: targetPasswordUpdatedAt,
+              password: undefined
             };
             if (targetEnv === env) updatedCount++;
           }
@@ -7330,6 +7796,35 @@ export class LocalStorageManager {
       }
 
       this.saveState(targetEnv, state);
+    }
+
+    if (typeof window !== 'undefined' && window.desktopAPI?.isDesktop && window.desktopAPI?.execute) {
+      const latestUsers = this.getState(env).users || [];
+      for (const u of latestUsers) {
+        window.desktopAPI.execute(
+          `INSERT OR REPLACE INTO users (
+            user_id, username, password_hash, password_salt, is_password_changed,
+            full_name, role, role_title, allowed_device_id, system_id, system_name,
+            is_active, updated_at, password_updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            u.user_id,
+            u.username,
+            u.password_hash || '',
+            u.password_salt || '',
+            u.is_password_changed ? 1 : 0,
+            u.full_name || '',
+            u.role || 'INTERNAL_MANAGER',
+            u.role_title || '',
+            u.allowed_device_id || u.system_id || 'OFFICE-PC-001',
+            u.system_id || u.allowed_device_id || 'OFFICE-PC-001',
+            u.system_name || '',
+            (u as any).is_active !== false ? 1 : 0,
+            u.updated_at || new Date().toISOString(),
+            u.password_updated_at || null
+          ]
+        ).catch(() => {});
+      }
     }
 
     if (updatedCount > 0 && typeof window !== 'undefined') {
@@ -7354,11 +7849,14 @@ export class LocalStorageManager {
     const idx = users.findIndex(u => u.user_id === userId);
     if (idx === -1) return false;
 
+    const now = new Date().toISOString();
     const updated = {
       ...users[idx],
       password_hash: newPasswordHash,
       password_salt: saltHex,
-      is_password_changed: true
+      is_password_changed: true,
+      password_updated_at: now,
+      updated_at: now
     };
     delete (updated as any).password;
     users[idx] = updated;
@@ -7385,7 +7883,9 @@ export class LocalStorageManager {
               ...otherState.users[oIdx],
               password_hash: newPasswordHash,
               password_salt: saltHex,
-              is_password_changed: true
+              is_password_changed: true,
+              password_updated_at: now,
+              updated_at: now
             };
             this.saveState(otherEnv, otherState);
           }

@@ -34,8 +34,8 @@ import {
   Trash2
 } from 'lucide-react';
 import { toPersianDigits, formatPersianDateTime } from '../utils/persian';
-import { getApiUrl } from '../sync-engine/sync-client';
-import { saveAuthCookie } from '../utils/cookieAuth';
+import { getApiUrl, SyncEngine, CLOUDFLARE_WORKER_URL } from '../sync-engine/sync-client';
+import { saveAuthCookie, getAuthCookie } from '../utils/cookieAuth';
 
 interface UsersManagementViewProps {
   currentUser: User;
@@ -227,24 +227,44 @@ export const UsersManagementView: React.FC<UsersManagementViewProps> = ({
         throw new Error(updateResult.error || 'خطا در ثبت اطلاعات در دیتابیس.');
       }
 
-      // Notify Central API and broadcast
+      // Notify Central API and Cloudflare Worker immediately, plus flush SyncEngine outbox
+      const authUpdatePayload = {
+        user_id: selectedUser.user_id,
+        username: cleanUsername,
+        old_username: selectedUser.username,
+        full_name: fullNameInput.trim(),
+        role_title: roleTitleInput.trim() || undefined,
+        system_id: systemIdInput.trim(),
+        system_name: systemNameInput.trim() || undefined,
+        password_hash: hashRecord ? hashRecord.hash : undefined,
+        password_salt: hashRecord ? hashRecord.salt : undefined,
+        password_updated_at: updateResult.user?.password_updated_at,
+        updated_at: updateResult.user?.updated_at
+      };
+
       try {
-        const changePassUrl = getApiUrl('/api/auth/change-password');
-        await fetch(changePassUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            user_id: selectedUser.user_id,
-            username: cleanUsername,
-            old_username: selectedUser.username,
-            full_name: fullNameInput.trim(),
-            role_title: roleTitleInput.trim() || undefined,
-            system_id: systemIdInput.trim(),
-            system_name: systemNameInput.trim() || undefined,
-            password_hash: hashRecord ? hashRecord.hash : undefined,
-            password_salt: hashRecord ? hashRecord.salt : undefined
-          })
-        });
+        const localChangeUrl = getApiUrl('/api/auth/change-password');
+        const workerChangeUrl = `${CLOUDFLARE_WORKER_URL}/api/auth/change-password`;
+        const requests: Promise<any>[] = [
+          fetch(localChangeUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(authUpdatePayload),
+            signal: AbortSignal.timeout(3500)
+          }).catch(() => {})
+        ];
+        if (localChangeUrl !== workerChangeUrl) {
+          requests.push(
+            fetch(workerChangeUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(authUpdatePayload),
+              signal: AbortSignal.timeout(3500)
+            }).catch(() => {})
+          );
+        }
+        requests.push(SyncEngine.pushDocumentInstantly(currentEnv).catch(() => {}));
+        await Promise.allSettled(requests);
       } catch (syncErr) {
         console.warn('[UsersManagementView] Backend user sync notice:', syncErr);
       }
@@ -252,9 +272,10 @@ export const UsersManagementView: React.FC<UsersManagementViewProps> = ({
       // If active current user updated their own password or username, update client session cookie immediately
       if (currentUser && (selectedUser.user_id === currentUser.user_id || selectedUser.username === currentUser.username)) {
         if (cleanNewPass) {
-          saveAuthCookie(cleanUsername, cleanNewPass);
+          saveAuthCookie(cleanUsername, cleanNewPass, hashRecord?.hash);
         } else {
-          saveAuthCookie(cleanUsername);
+          const existingCookie = getAuthCookie();
+          saveAuthCookie(cleanUsername, existingCookie?.password || '', updateResult.user?.password_hash);
         }
       }
 
@@ -289,6 +310,7 @@ export const UsersManagementView: React.FC<UsersManagementViewProps> = ({
     try {
       const computed = await hashPassword(newUserData.password || '123456');
       const newUserId = `USR-${Date.now().toString().slice(-4)}`;
+      const now = new Date().toISOString();
 
       const newUser: User = {
         user_id: newUserId,
@@ -296,6 +318,8 @@ export const UsersManagementView: React.FC<UsersManagementViewProps> = ({
         password_salt: computed.salt,
         password_hash: computed.hash,
         is_password_changed: true,
+        password_updated_at: now,
+        updated_at: now,
         full_name: newUserData.full_name.trim(),
         role: newUserData.role,
         role_title: newUserData.role_title.trim(),
@@ -309,6 +333,26 @@ export const UsersManagementView: React.FC<UsersManagementViewProps> = ({
       if (!saveRes.success) {
         throw new Error(saveRes.error || 'خطا در ثبت کاربر');
       }
+
+      const localUserUrl = getApiUrl('/api/auth/user-update');
+      const workerUserUrl = `${CLOUDFLARE_WORKER_URL}/api/auth/user-update`;
+      await Promise.allSettled([
+        fetch(localUserUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...newUser, create_if_missing: true }),
+          signal: AbortSignal.timeout(3500)
+        }).catch(() => {}),
+        ...(localUserUrl !== workerUserUrl ? [
+          fetch(workerUserUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...newUser, create_if_missing: true }),
+            signal: AbortSignal.timeout(3500)
+          }).catch(() => {})
+        ] : []),
+        SyncEngine.pushDocumentInstantly(currentEnv).catch(() => {})
+      ]);
 
       refreshUserList();
       setSelectedUserId(newUserId);

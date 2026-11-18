@@ -29,7 +29,7 @@ import {
 } from 'lucide-react';
 import { toPersianDigits } from '../utils/persian';
 import { saveAuthCookie } from '../utils/cookieAuth';
-import { getApiUrl } from '../sync-engine/sync-client';
+import { getApiUrl, SyncEngine, CLOUDFLARE_WORKER_URL } from '../sync-engine/sync-client';
 
 interface SecuritySettingsModalProps {
   isOpen: boolean;
@@ -188,29 +188,50 @@ export const SecuritySettingsModal: React.FC<SecuritySettingsModalProps> = ({
         throw new Error(updateResult.error || 'خطا در ثبت اطلاعات در دیتابیس.');
       }
 
-      // Sync with Central Backend API
+      // Sync with Central Backend API, Cloudflare Worker, and SyncEngine immediately
+      const authUpdatePayload = {
+        user_id: targetUser.user_id,
+        username: targetUser.username,
+        old_username: targetUser.username,
+        full_name: fullNameInput.trim(),
+        role_title: roleTitleInput.trim() || undefined,
+        system_id: systemIdInput.trim(),
+        system_name: systemNameInput.trim() || undefined,
+        password_hash: hashRecord ? hashRecord.hash : undefined,
+        password_salt: hashRecord ? hashRecord.salt : undefined,
+        password_updated_at: updateResult.user?.password_updated_at,
+        updated_at: updateResult.user?.updated_at
+      };
+
       try {
-        const changePassUrl = getApiUrl('/api/auth/change-password');
-        await fetch(changePassUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            user_id: targetUser.user_id,
-            username: targetUser.username,
-            old_username: targetUser.username,
-            full_name: fullNameInput.trim(),
-            role_title: roleTitleInput.trim() || undefined,
-            system_id: systemIdInput.trim(),
-            password_hash: hashRecord ? hashRecord.hash : undefined,
-            password_salt: hashRecord ? hashRecord.salt : undefined
-          })
-        });
+        const localChangeUrl = getApiUrl('/api/auth/change-password');
+        const workerChangeUrl = `${CLOUDFLARE_WORKER_URL}/api/auth/change-password`;
+        const requests: Promise<any>[] = [
+          fetch(localChangeUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(authUpdatePayload),
+            signal: AbortSignal.timeout(3500)
+          }).catch(() => {})
+        ];
+        if (localChangeUrl !== workerChangeUrl) {
+          requests.push(
+            fetch(workerChangeUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(authUpdatePayload),
+              signal: AbortSignal.timeout(3500)
+            }).catch(() => {})
+          );
+        }
+        requests.push(SyncEngine.pushDocumentInstantly(currentEnv).catch(() => {}));
+        await Promise.allSettled(requests);
       } catch (err) {
         console.warn('Backend sync notice:', err);
       }
 
       if (cleanNewPass && targetUser.username === currentUser.username) {
-        saveAuthCookie(targetUser.username, cleanNewPass);
+        saveAuthCookie(targetUser.username, cleanNewPass, hashRecord?.hash);
       }
 
       setStatusMessage({

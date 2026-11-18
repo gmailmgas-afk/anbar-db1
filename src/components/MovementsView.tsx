@@ -40,6 +40,7 @@ import {
 } from '../utils/persian';
 import { SEED_USERS } from '../database/seed-data';
 import { LocalStorageManager } from '../database/storage';
+import { SyncEngine } from '../sync-engine/sync-client';
 import { ValveEntryModal } from './ValveEntryModal';
 import { GoodsEntryReceiptModal } from './GoodsEntryReceiptModal';
 import { GoodsExitReceiptModal } from './GoodsExitReceiptModal';
@@ -288,15 +289,19 @@ export const MovementsView: React.FC<MovementsViewProps> = ({
   const handleConfirmZeroAll = async () => {
     setIsZeroing(true);
     try {
-      LocalStorageManager.zeroAllWarehouseStock(
-        currentEnv,
-        currentUser?.full_name || 'مدیریت ارشد',
-        true
-      );
+      const author = currentUser?.full_name || 'مدیریت ارشد';
+      const purgedAt = new Date().toISOString();
+      LocalStorageManager.zeroAllWarehouseStock(currentEnv, author, true);
+      await SyncEngine.executeRemotePurge(currentEnv, {
+        mode: 'ZERO_ALL',
+        author,
+        purgedAt
+      });
+      await SyncEngine.syncNow(currentEnv);
       setShowZeroInventoryModal(false);
       setToastMessage({
         type: 'success',
-        text: 'تمامی موجودی‌ها و گردش‌های انبار در هر ۳ پایگاه داده با موفقیت صفر شدند.'
+        text: 'تمامی موجودی‌ها، گردش‌ها و کاردکس‌های انبار در هر ۳ پایگاه داده و تمام دستگاه‌ها با موفقیت صفر شدند.'
       });
       setTimeout(() => setToastMessage(null), 8000);
       if (onRefresh) onRefresh();

@@ -125,13 +125,20 @@ export const TriSyncInspectorView: React.FC<TriSyncInspectorViewProps> = ({
     if (!isManagerAmouei) return;
     setIsZeroingStock(true);
     try {
-      LocalStorageManager.purgeDatabaseExceptProducts(currentEnv, currentUser.full_name || 'مهندس موسی عمویی', true);
+      const author = currentUser.full_name || 'مهندس موسی عمویی';
+      const purgedAt = new Date().toISOString();
+      LocalStorageManager.purgeDatabaseExceptProducts(currentEnv, author, true);
       SyncEngine.clearLogs();
+      await SyncEngine.executeRemotePurge(currentEnv, {
+        mode: 'PURGE_EXCEPT_PRODUCTS',
+        author,
+        purgedAt
+      });
       await SyncEngine.syncNow(currentEnv);
       if (onRefreshDatabase) {
         onRefreshDatabase();
       }
-      setZeroSuccessMessage('کلیه داده‌های پایگاه‌داده، اسناد و گزارش‌ها با موفقیت پاک‌سازی شدند و تمامی موجودی‌ها صفر گردیدند. نام و کاتالوگ کالاها کاملاً حفظ شدند.');
+      setZeroSuccessMessage('کلیه داده‌های پایگاه‌داده، اسناد، کاردکس‌ها، فاکتورها و اعلان‌ها در تمامی دستگاه‌ها با موفقیت پاک‌سازی شدند و تمامی موجودی‌ها صفر گردیدند. نام و کاتالوگ کالاها کاملاً حفظ شدند.');
       setIsZeroConfirmChecked(false);
       fetchD1State();
     } catch (err: any) {

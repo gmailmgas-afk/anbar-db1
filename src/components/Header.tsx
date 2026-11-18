@@ -14,9 +14,11 @@ import {
   Globe,
   Sun,
   Moon,
-  KeyRound
+  KeyRound,
+  Bell
 } from 'lucide-react';
 import { MGasOfficialLogo } from './MGasOfficialLogo';
+import { toPersianDigits } from '../utils/persian';
 
 interface HeaderProps {
   currentEnv: RuntimeEnvironment;
@@ -40,6 +42,8 @@ interface HeaderProps {
   onToggleMobileMenu?: () => void;
   theme?: 'dark' | 'light';
   onToggleTheme?: () => void;
+  unreadNotificationsCount?: number;
+  onOpenNotifications?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -60,7 +64,9 @@ export const Header: React.FC<HeaderProps> = ({
   isMobileMenuOpen,
   onToggleMobileMenu,
   theme = 'dark',
-  onToggleTheme
+  onToggleTheme,
+  unreadNotificationsCount = 0,
+  onOpenNotifications
 }) => {
   return (
     <header className="w-full bg-slate-900 border-b border-slate-800 text-slate-100 sticky top-0 z-40 px-2 sm:px-4 py-1.5 sm:py-2.5 shadow-md transition-colors duration-200">
@@ -92,8 +98,30 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           </div>
 
-          {/* Left Side: User Profile & Session Controls */}
+          {/* Left Side: Notification Bell + User Profile & Session Controls */}
           <div className="flex items-center gap-1 sm:gap-2 justify-end shrink-0 min-w-0">
+            {onOpenNotifications && (
+              <button
+                type="button"
+                onClick={onOpenNotifications}
+                title="مرکز اعلان‌های همزمان سامانه"
+                aria-label="مرکز اعلان‌ها"
+                className={`relative p-1.5 sm:px-2.5 sm:py-1.5 rounded-lg sm:rounded-xl border transition-all flex items-center gap-1.5 cursor-pointer shrink-0 ${
+                  unreadNotificationsCount > 0
+                    ? 'bg-amber-500/20 hover:bg-amber-500/30 border-amber-400/70 text-amber-200 shadow-sm'
+                    : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300 hover:text-white'
+                }`}
+              >
+                <Bell className={`w-4 h-4 ${unreadNotificationsCount > 0 ? 'text-amber-300 animate-pulse' : 'text-slate-300'}`} />
+                <span className="hidden lg:inline text-xs font-bold">اعلان‌ها</span>
+                {unreadNotificationsCount > 0 && (
+                  <span className="px-1.5 py-0.5 rounded-md bg-rose-600 text-white text-[10px] font-extrabold tabular-nums leading-none">
+                    {toPersianDigits(unreadNotificationsCount)}
+                  </span>
+                )}
+              </button>
+            )}
+
             <div className="flex items-center gap-1 sm:gap-2 bg-[#fbf7ee] border border-amber-300/90 px-1.5 sm:px-3 py-1 sm:py-1.5 rounded-lg sm:rounded-xl shadow-sm min-w-0 text-slate-900">
               <UserCheck className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-800 shrink-0" />
               <div className="flex flex-col text-right min-w-0">

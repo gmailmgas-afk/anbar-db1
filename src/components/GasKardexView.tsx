@@ -405,9 +405,11 @@ export const GasKardexView: React.FC<GasKardexViewProps> = ({
 
     window.addEventListener('mgas:cylinder_mappings_updated', handleMappingsUpdated);
     window.addEventListener('mgas:database_refreshed', handleMappingsUpdated);
+    window.addEventListener('mgas:database_purged', handleMappingsUpdated);
     return () => {
       window.removeEventListener('mgas:cylinder_mappings_updated', handleMappingsUpdated);
       window.removeEventListener('mgas:database_refreshed', handleMappingsUpdated);
+      window.removeEventListener('mgas:database_purged', handleMappingsUpdated);
     };
   }, [currentEnv]);
 
@@ -659,18 +661,56 @@ export const GasKardexView: React.FC<GasKardexViewProps> = ({
     const fresh = LocalStorageManager.getState(currentEnv);
     setAllKardexEntries([...(fresh.gas_kardex_entries || []).map(e => ({ ...e }))]);
 
+    const syncGlobalKardexNotifications = () => {
+      const updated = LocalStorageManager.getState(currentEnv);
+      if (updated.is_purged && (!updated.notifications || updated.notifications.length === 0)) {
+        setNotificationHistory([]);
+        return;
+      }
+      const globalItems = LocalStorageManager.getNotificationsForUser(currentEnv, currentUser)
+        .filter(n => n.category === 'KARDEX_REPAIR' || n.category === 'INSPECTION')
+        .slice(0, 20)
+        .map(n => ({
+          id: n.notification_id,
+          message: `${n.title}: ${n.message}`,
+          type: (n.level === 'error' ? 'error' : n.level === 'success' ? 'success' : 'info') as 'success' | 'info' | 'error',
+          time: new Date(n.created_at).toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          read: Array.isArray(n.read_by) && currentUser?.user_id ? n.read_by.includes(currentUser.user_id) : false
+        }));
+      if (globalItems.length > 0) {
+        setNotificationHistory(prev => {
+          const existingIds = new Set(prev.map(p => p.id));
+          const merged = [...globalItems.filter(g => !existingIds.has(g.id)), ...prev];
+          return merged.slice(0, 30);
+        });
+      }
+    };
+    syncGlobalKardexNotifications();
+
     // 2. LocalStorageManager subscriber (fired whenever recordLocalChange/saveState runs anywhere)
     const unsubscribeStorage = LocalStorageManager.subscribe(() => {
       const updated = LocalStorageManager.getState(currentEnv);
       setAllKardexEntries([...(updated.gas_kardex_entries || []).map(e => ({ ...e }))]);
+      if (updated.is_purged && (!updated.notifications || updated.notifications.length === 0)) {
+        setNotificationHistory([]);
+      }
     });
 
     // 3. Database refreshed event handler (silent instant update)
     const handleDbRefreshed = () => {
       const updated = LocalStorageManager.getState(currentEnv);
       setAllKardexEntries([...(updated.gas_kardex_entries || []).map(e => ({ ...e }))]);
+      syncGlobalKardexNotifications();
     };
     window.addEventListener('mgas:db_refreshed' as any, handleDbRefreshed);
+    window.addEventListener('mgas:notifications_updated' as any, syncGlobalKardexNotifications);
+
+    const handleDatabasePurged = () => {
+      setAllKardexEntries([]);
+      setNotificationHistory([]);
+      setWarehouseStockVersion(v => v + 1);
+    };
+    window.addEventListener('mgas:database_purged' as any, handleDatabasePurged);
 
     // 4. Trash updated event handler (instant row removal/restoration)
     const handleTrashUpdated = () => {
@@ -719,12 +759,14 @@ export const GasKardexView: React.FC<GasKardexViewProps> = ({
     return () => {
       unsubscribeStorage();
       window.removeEventListener('mgas:db_refreshed' as any, handleDbRefreshed);
+      window.removeEventListener('mgas:notifications_updated' as any, syncGlobalKardexNotifications);
+      window.removeEventListener('mgas:database_purged' as any, handleDatabasePurged);
       window.removeEventListener('mgas:kardex_trash_updated' as any, handleTrashUpdated);
       window.removeEventListener('mgas:kardex_updated' as any, handleKardexUpdated);
       if (bc) bc.close();
       if (cleanupDesktop) cleanupDesktop();
     };
-  }, [currentEnv, selectedCustomerId]);
+  }, [currentEnv, selectedCustomerId, currentUser]);
 
   // Active Customer Object
   const currentCustomer = useMemo(() => {
@@ -1055,11 +1097,13 @@ export const GasKardexView: React.FC<GasKardexViewProps> = ({
     window.addEventListener('mgas:stock_movement_added', handleStockChanged);
     window.addEventListener('mgas:inspection_added', handleStockChanged);
     window.addEventListener('mgas:database_refreshed', handleStockChanged);
+    window.addEventListener('mgas:database_purged', handleStockChanged);
     window.addEventListener('mgas:cylinder_mappings_updated', handleStockChanged);
     return () => {
       window.removeEventListener('mgas:stock_movement_added', handleStockChanged);
       window.removeEventListener('mgas:inspection_added', handleStockChanged);
       window.removeEventListener('mgas:database_refreshed', handleStockChanged);
+      window.removeEventListener('mgas:database_purged', handleStockChanged);
       window.removeEventListener('mgas:cylinder_mappings_updated', handleStockChanged);
     };
   }, []);
