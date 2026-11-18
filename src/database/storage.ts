@@ -331,6 +331,12 @@ export class LocalStorageManager {
           if (s.custom_cylinder_item_types) {
             s.custom_cylinder_item_types = s.custom_cylinder_item_types.filter(c => c.id !== cleanId);
           }
+          if (s.suppliers) {
+            s.suppliers = s.suppliers.filter(sup => sup.supplier_id !== cleanId);
+          }
+          if (s.customers) {
+            s.customers = s.customers.filter(c => c.customer_id !== cleanId);
+          }
           this.saveState(env, s);
         }
       } catch {}
@@ -461,6 +467,15 @@ export class LocalStorageManager {
       loadedState = getInitialState(env);
     }
 
+    // Hydrate permanent tombstone registry from persisted state
+    if (Array.isArray(loadedState.deleted_entity_ids)) {
+      loadedState.deleted_entity_ids.forEach((id) => {
+        if (id && typeof id === 'string') {
+          this.permanentlyDeletedIds.add(id.trim());
+        }
+      });
+    }
+
     this.ensureSeedUsersExist(loadedState);
     this.ensureValveProductsExist(loadedState);
     this.ensureNutCategoryAndProductsExist(loadedState);
@@ -548,6 +563,7 @@ export class LocalStorageManager {
       products: state.products ? [...state.products] : [],
       categories: state.categories ? [...state.categories] : [],
       customers: state.customers ? [...state.customers] : [],
+      suppliers: state.suppliers ? [...state.suppliers] : [],
       warehouses: state.warehouses ? [...state.warehouses] : [],
       goods_receipts: state.goods_receipts ? [...state.goods_receipts] : [],
       invoices: state.invoices ? [...state.invoices] : [],
@@ -1278,11 +1294,22 @@ export class LocalStorageManager {
   static ensureSuppliersLoaded(state: LocalDatabaseState) {
     if (!state.suppliers) state.suppliers = [];
 
+    // Do not resurrect SUP-MGAS-BRANCH if explicitly deleted by admin
+    if (
+      this.isEntityPermanentlyDeleted('SUP-MGAS-BRANCH') ||
+      state.deleted_entity_ids?.includes('SUP-MGAS-BRANCH')
+    ) {
+      return;
+    }
+
     const mgasSupplier: Supplier = {
       supplier_id: 'SUP-MGAS-BRANCH',
       name: 'شعبه ام گاز',
       company_name: 'شرکت ام گاز (شعبه مرکزی تأمین شیرآلات و تجهیزات)',
       phone: '021-44556677',
+      province: 'تهران',
+      city: 'تهران',
+      supplier_type: 'سازمانی',
       address: 'کارخانه مرکزی ام‌گاز - واحد تأمین شیرآلات و سیلندر',
       credit_limit: 10000000000,
       current_balance: 0,
@@ -1303,7 +1330,7 @@ export class LocalStorageManager {
       state.suppliers[existingIdx] = {
         ...state.suppliers[existingIdx],
         supplier_id: state.suppliers[existingIdx].supplier_id || 'SUP-MGAS-BRANCH',
-        name: 'شعبه ام گاز'
+        name: state.suppliers[existingIdx].name || 'شعبه ام گاز'
       };
     }
   }
@@ -2747,6 +2774,14 @@ export class LocalStorageManager {
         message = `${actorName} کالای «${p.name || event.entity_id}» را ${isDelete ? 'حذف' : isUpdate ? 'ویرایش' : 'تعریف'} کرد.`;
         break;
       }
+      case 'SUPPLIER': {
+        category = 'INVENTORY';
+        targetTab = 'suppliers';
+        level = isDelete ? 'warning' : isUpdate ? 'info' : 'success';
+        title = isDelete ? 'حذف پرونده تأمین‌کننده' : isUpdate ? 'ویرایش پرونده تأمین‌کننده' : 'ثبت تأمین‌کننده جدید';
+        message = `${actorName} پرونده تأمین‌کننده «${p.company_name || p.name || event.entity_id}» را ${isDelete ? 'حذف' : isUpdate ? 'ویرایش' : 'ثبت'} کرد.`;
+        break;
+      }
       default:
         return null;
     }
@@ -2905,9 +2940,15 @@ export class LocalStorageManager {
       case 'CUSTOMER': {
         const cust = payload as Customer;
         const targetId = cust?.customer_id || event.entity_id;
+        if (!state.customers) state.customers = [];
         const idx = state.customers.findIndex(c => c.customer_id === targetId);
         if (event.event_type === 'DELETE') {
           if (idx >= 0) state.customers.splice(idx, 1);
+          if (!state.deleted_entity_ids) state.deleted_entity_ids = [];
+          if (targetId && !state.deleted_entity_ids.includes(targetId)) {
+            state.deleted_entity_ids.push(targetId);
+          }
+          this.markEntityPermanentlyDeleted(targetId);
         } else if (idx >= 0) {
           state.customers[idx] = { ...state.customers[idx], ...cust, updated_at: new Date().toISOString() };
         } else if (cust) {
@@ -2932,9 +2973,15 @@ export class LocalStorageManager {
       case 'SUPPLIER': {
         const sup = payload as Supplier;
         const targetId = sup?.supplier_id || event.entity_id;
+        if (!state.suppliers) state.suppliers = [];
         const idx = state.suppliers.findIndex(s => s.supplier_id === targetId);
         if (event.event_type === 'DELETE') {
           if (idx >= 0) state.suppliers.splice(idx, 1);
+          if (!state.deleted_entity_ids) state.deleted_entity_ids = [];
+          if (targetId && !state.deleted_entity_ids.includes(targetId)) {
+            state.deleted_entity_ids.push(targetId);
+          }
+          this.markEntityPermanentlyDeleted(targetId);
         } else if (idx >= 0) {
           state.suppliers[idx] = { ...state.suppliers[idx], ...sup, updated_at: new Date().toISOString() };
         } else if (sup) {

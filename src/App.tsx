@@ -1159,6 +1159,8 @@ export default function App() {
               suppliers={localDb.suppliers}
               currentEnv={currentEnv}
               currentUser={currentUser}
+              onRefresh={refreshLocalState}
+              onSwitchToCustomers={() => setActiveTab('customers')}
             />
           )}
 

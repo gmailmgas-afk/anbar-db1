@@ -237,18 +237,27 @@ export interface Customer {
 export interface Supplier {
   supplier_id: string;
   name: string;
-  company_name: string;
+  company_name?: string;
+  manager_name?: string;
   contact_person?: string;
   phone: string;
+  phone_secondary?: string;
+  national_id?: string;
   economic_code?: string;
+  postal_code?: string;
   province?: string;
   city?: string;
   address?: string;
   credit_limit: number;
-  current_balance: number;
+  current_balance: number; // positive = creditor, negative = debtor
+  supplier_type?: 'عمده' | 'خرده' | 'سازمانی' | 'پیمانکاری';
   notes?: string;
   created_at: string;
   updated_at: string;
+  registration_number?: string; // شماره ثبت
+  fax?: string;                 // فکس
+  employer_phone?: string;      // تلفن کارفرما
+  row_index?: number;           // ردیف
 }
 
 export interface Invoice {
